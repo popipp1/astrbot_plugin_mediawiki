@@ -63,7 +63,7 @@
 
 ## 安装
 
-将插件目录放入 AstrBot 的 `data/plugins/astrbot_plugin_mediawiki`，或推送到 GitHub 后通过 WebUI 安装。插件依赖会根据 `requirements.txt` 安装。
+在 AstrBot WebUI 的插件管理中通过仓库地址 `https://github.com/popipp1/astrbot_plugin_mediawiki` 安装，也可以将插件目录放入 AstrBot 的 `data/plugins/astrbot_plugin_mediawiki`。插件依赖会根据 `requirements.txt` 安装。
 
 安装后，在插件配置中将 `api_url` 改为目标 Wiki 的 API 地址，例如：
 
@@ -192,4 +192,4 @@ SILI-agent 当前仓库没有可直接移植的 MediaWiki 最近更改推送模�
 
 ## 发布前
 
-请修改 `metadata.yaml` 中的 `author` 和 `repo`，并按照 AstrBot 插件市场要求补充仓库地址、许可证和图标。
+仓库地址已写入 `metadata.yaml`。提交 AstrBot 插件市场前，请确认作者信息，并按照市场要求补充许可证和图标。
