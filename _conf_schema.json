@@ -1,0 +1,146 @@
+{
+  "api_url": {
+    "description": "MediaWiki API 地址",
+    "type": "string",
+    "hint": "必须是以 /api.php 结尾的完整 http/https 地址。",
+    "obvious_hint": true,
+    "default": "https://zh.wikipedia.org/w/api.php"
+  },
+  "api_username": {
+    "description": "MediaWiki Bot Password 登录名",
+    "type": "string",
+    "hint": "站点禁止匿名 API 时填写。通常为“账号名@机器人名”；与下方密码必须同时填写。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "api_bot_password": {
+    "description": "MediaWiki Bot Password（非账号主密码）",
+    "type": "string",
+    "hint": "在目标 Wiki 的 Special:BotPasswords 创建。AstrBot 会把配置保存在本机 data/config，请保护该文件且不要填写账号主密码。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "user_agent": {
+    "description": "HTTP User-Agent",
+    "type": "string",
+    "hint": "部分 Wiki 要求使用可识别的 User-Agent；建议包含机器人名称和联系方式。",
+    "default": "AstrBot-MediaWiki/1.5.0"
+  },
+  "timeout_seconds": {
+    "description": "请求超时秒数",
+    "type": "int",
+    "default": 12
+  },
+  "summary_chars": {
+    "description": "摘要最大字符数",
+    "type": "int",
+    "hint": "MediaWiki TextExtracts 支持 50–1200，本插件会自动限制到该范围。",
+    "default": 200
+  },
+  "show_summary": {
+    "description": "默认显示页面摘要",
+    "type": "bool",
+    "default": true
+  },
+  "search_if_missing": {
+    "description": "页面不存在时默认搜索",
+    "type": "bool",
+    "hint": "也可以在单次查询中使用 -s 或 --search。",
+    "default": false
+  },
+  "auto_expand_brackets": {
+    "description": "未 @ 机器人时也自动展开 [[页面名]]",
+    "type": "bool",
+    "hint": "@机器人 [[页面名]] 始终生效；启用本项后，没有 @ 机器人的普通消息也会触发查询。",
+    "default": false
+  },
+  "qq_link_prefix": {
+    "description": "QQ 链接前缀",
+    "type": "string",
+    "hint": "通常留空。若 OneBot 无法发送链接，可填写 #；仅对 aiocqhttp/OneBot 生效。",
+    "default": ""
+  },
+  "change_push_enabled": {
+    "description": "启用 Wiki 变更推送",
+    "type": "bool",
+    "hint": "启用后定时检查通过 /wiki监控 和 /wiki监控条目 添加的订阅，并主动推送到订阅会话。",
+    "default": true
+  },
+  "change_poll_interval_seconds": {
+    "description": "Wiki 变更检查间隔（秒）",
+    "type": "int",
+    "hint": "最小 30 秒；建议 120 秒或更长，避免给 Wiki API 造成压力。",
+    "default": 120
+  },
+  "change_category_depth": {
+    "description": "子分类递归深度",
+    "type": "int",
+    "hint": "0 表示仅直接成员，1 表示再展开一层子分类；最大 10。",
+    "default": 2
+  },
+  "change_category_refresh_interval_seconds": {
+    "description": "分类树刷新间隔（秒）",
+    "type": "int",
+    "hint": "分类成员树独立低频刷新；相同分类只请求一次。最小 60 秒，默认 900 秒。",
+    "default": 900
+  },
+  "change_new_page_grace_seconds": {
+    "description": "新页面分类识别重试窗口（秒）",
+    "type": "int",
+    "hint": "新页面暂未出现在目标分类时，在该窗口内继续重查，避免分类索引延迟造成漏报；0 表示关闭，最大 3600 秒。",
+    "default": 900
+  },
+  "change_max_members": {
+    "description": "单个分类树的抓取数量上限",
+    "type": "int",
+    "hint": "达到上限后停止展开该分类树，未抓取的成员可能漏报；新页面分类检查可额外补充成员。",
+    "default": 5000
+  },
+  "change_max_changes_per_poll": {
+    "description": "单轮最多读取的全站变更数",
+    "type": "int",
+    "hint": "每轮处理数量有限，剩余变更将在后续检查中继续读取。",
+    "default": 1000
+  },
+  "change_overlap_seconds": {
+    "description": "最近更改重叠窗口（秒）",
+    "type": "int",
+    "hint": "每次从上次读取位置前若干秒重新查询，并按 RCID 去重，以减少延迟写入造成的漏报；最大 600 秒。",
+    "default": 60
+  },
+  "change_recent_rcid_limit": {
+    "description": "已处理变更 ID 的保存数量",
+    "type": "int",
+    "hint": "保存最近已处理的变更 ID，避免重叠轮询重复推送；范围 1000–100000。",
+    "default": 20000
+  },
+  "change_diff_lines": {
+    "description": "每条推送最多显示的差异项目数",
+    "type": "int",
+    "hint": "修改前后作为一项；优先覆盖不同差异行。超出时显示省略提示，设为 0 时不请求差异。",
+    "default": 5
+  },
+  "change_diff_line_chars": {
+    "description": "单侧文本差异预览的字符上限",
+    "hint": "紧凑预览每侧最多 60 字符；此项小于 60 时使用更小值（最低 20）。",
+    "type": "int",
+    "default": 180
+  },
+  "change_message_max_chars": {
+    "description": "单条监控消息最大字符数",
+    "type": "int",
+    "hint": "包含标题、摘要、链接与差异，范围 500–5000。超出时按完整差异项目省略并提示。",
+    "default": 900
+  },
+  "change_pending_limit": {
+    "description": "待发送通知队列上限",
+    "type": "int",
+    "hint": "发送失败的通知会持久化并在后续轮询重试。",
+    "default": 500
+  },
+  "change_include_bot_edits": {
+    "description": "包含标记为机器人编辑的变更",
+    "type": "bool",
+    "default": true
+  }
+}
