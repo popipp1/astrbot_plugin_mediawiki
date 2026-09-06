@@ -452,13 +452,20 @@ def format_change_notification(
     )
     delta = f"{change.size_delta:+d}"
     flags = ""
-    if change.change_type == "new":
+    is_new_page = change.change_type == "new"
+    if is_new_page:
         flags += " N"
     if change.minor:
         flags += " m"
     if change.bot:
         flags += " b"
-    link = build_diff_url(api_url, change)
+    if is_new_page:
+        params = {"curid": change.pageid} if change.pageid > 0 else {"title": change.title}
+        link = get_index_url(api_url, params)
+        # New pages link to the article itself, never to a comparison or preview.
+        diff_lines = []
+    else:
+        link = build_diff_url(api_url, change)
     if link_prefix:
         link = f"{link_prefix}{link}"
     comment = change.comment
@@ -502,7 +509,8 @@ def format_change_notification(
             lines = [value for value in lines if value != f"💬{_visible_diff(comment, 100)}"]
             message = '\n'.join(lines)
         return message
-    footer = "…已达到消息长度上限，其余内容请查看差异链接"
+    footer = ("…已达到消息长度上限，其余内容请查看条目链接" if is_new_page
+              else "…已达到消息长度上限，其余内容请查看差异链接")
     header = lines[:header_count]
     # Preserve the URL and metadata; summaries and subscription labels are optional.
     while len('\n'.join(header)) + len(footer) + 1 > max_message_chars and len(header) > 3:
@@ -1008,8 +1016,11 @@ class WikiChangeMonitor:
                     )
                     break
                 result.matched += len(new_targets)
-                diff_lines: list[DiffLine] = [DiffLine("notice", "差异预览已关闭")]
-                if new_targets and self.max_diff_lines:
+                diff_lines: list[DiffLine] = (
+                    [] if change.change_type == "new"
+                    else [DiffLine("notice", "差异预览已关闭")]
+                )
+                if new_targets and self.max_diff_lines and change.change_type != "new":
                     try:
                         diff_html = await self.client.compare_revisions(
                             change.old_revid, change.revid

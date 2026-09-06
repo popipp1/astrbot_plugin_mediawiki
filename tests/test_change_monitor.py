@@ -4,8 +4,10 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from change_monitor import (
+    DiffLine,
     SUBSCRIPTION_CATEGORY,
     SUBSCRIPTION_PAGE,
     JsonStateStore,
@@ -36,6 +38,33 @@ def sample_change() -> RecentChange:
 
 
 class FormattingTests(unittest.TestCase):
+    def test_new_page_uses_article_link_without_diff_preview(self):
+        for pageid in (42, 0):
+            with self.subTest(pageid=pageid):
+                change = replace(sample_change(), change_type="new", pageid=pageid, old_revid=0)
+                message = format_change_notification(
+                    change, ["Category:SIFAC"],
+                    [DiffLine("add", "新页面正文"), DiffLine("notice", "差异预览已关闭")],
+                    api_url="https://zh.moegirl.org.cn/api.php", link_prefix="#",
+                )
+                link = next(line[1:] for line in message.splitlines() if line.startswith("#https://"))
+                self.assertEqual(parse_qs(urlsplit(link).query),
+                                 {"curid": ["42"]} if pageid else {"title": [change.title]})
+                self.assertIn(" N |", message)
+                self.assertIn("💬补充翻唱版本", message)
+                self.assertNotIn("差异", message)
+                self.assertNotIn("✏", message)
+
+    def test_new_page_length_limit_does_not_mention_diff(self):
+        message = format_change_notification(
+            replace(sample_change(), change_type="new"), [], [],
+            api_url="https://example.org/" + "a" * 600 + "/api.php",
+            max_message_chars=500,
+        )
+        self.assertLessEqual(len(message), 500)
+        self.assertIn("请查看条目链接", message)
+        self.assertNotIn("差异", message)
+
     def test_normalize_category(self):
         self.assertEqual(normalize_category(" 分类：测试分类 "), "Category:测试分类")
         self.assertEqual(normalize_category("Category:Foo_bar"), "Category:Foo bar")
@@ -93,6 +122,7 @@ class FakeClient:
         self.page_categories_error = None
         self.category_tree_categories = ["Category:SIFAC"]
         self.recent_since = ""
+        self.compare_calls = 0
 
     async def server_timestamp(self):
         return "2026-09-04T01:00:00Z"
@@ -120,6 +150,7 @@ class FakeClient:
         return [item for item in self.changes if item.rcid not in excluded]
 
     async def compare_revisions(self, _old_revid, _revid):
+        self.compare_calls += 1
         return '<td class="diff-addedline">==翻唱版本==</td>'
 
 
@@ -228,6 +259,11 @@ class MonitorWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.page_categories_calls, 1)
             self.assertIn("刚创建的页面", messages[0])
             self.assertIn(" N |", messages[0])
+            self.assertIn("index.php?curid=99", messages[0])
+            self.assertNotIn("diff=", messages[0])
+            self.assertNotIn("差异", messages[0])
+            self.assertNotIn("✏", messages[0])
+            self.assertEqual(client.compare_calls, 0)
             self.assertIn(99, monitor.state.subscriptions[0].member_page_ids)
 
     async def test_new_page_in_known_subcategory_is_sent(self):
