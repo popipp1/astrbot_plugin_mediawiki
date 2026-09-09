@@ -24,7 +24,7 @@
     "description": "HTTP User-Agent",
     "type": "string",
     "hint": "部分 Wiki 要求使用可识别的 User-Agent；建议包含机器人名称和联系方式。",
-    "default": "AstrBot-MediaWiki/1.5.0"
+    "default": "AstrBot-MediaWiki/1.8.0"
   },
   "timeout_seconds": {
     "description": "请求超时秒数",
@@ -117,7 +117,7 @@
   "change_diff_lines": {
     "description": "每条推送最多显示的差异项目数",
     "type": "int",
-    "hint": "修改前后作为一项；优先覆盖不同差异行。超出时显示省略提示，设为 0 时不请求差异。",
+    "hint": "正文优先，空行不挤占正文名额；章节和首条内容、表格行、修改前后分别作为完整项目。0 关闭文本差异及其模型查询，但重定向识别开关独立，仍可能请求历史源码。",
     "default": 5
   },
   "change_diff_line_chars": {
@@ -129,14 +129,32 @@
   "change_message_max_chars": {
     "description": "单条监控消息最大字符数",
     "type": "int",
-    "hint": "包含标题、摘要、链接与差异，范围 500–5000。超出时按完整差异项目省略并提示。",
-    "default": 900
+    "hint": "包含标题、摘要、链接与差异，范围 500–5000，新安装默认 700。升级不覆盖已有配置，需更紧凑时手动改为 700。超出时按完整差异项目省略并提示。",
+    "default": 700
   },
   "change_pending_limit": {
     "description": "待发送通知队列上限",
     "type": "int",
     "hint": "发送失败的通知会持久化并在后续轮询重试。",
     "default": 500
+  },
+  "change_include_moves": {
+    "description": "推送页面移动日志",
+    "type": "bool",
+    "hint": "默认开启；通知旧标题、新标题及重定向保留状态，使用日志链接。仅处理 move/move_redir，不包含删除、恢复等日志。",
+    "default": true
+  },
+  "change_watch_category_redirects": {
+    "description": "推送指向分类成员的新建重定向",
+    "type": "bool",
+    "hint": "默认开启，需同时开启重定向识别。有分类订阅时读取新建页对应修订，按直接目标的 pageid 匹配分类树成员；别名自身无需分类。保留目标章节，不追踪跳转链，不自动监控既有别名的后续编辑。会增加新建页源码和目标基本信息请求。",
+    "default": true
+  },
+  "change_detect_redirects": {
+    "description": "识别重定向新建、目标变更和取消",
+    "type": "bool",
+    "hint": "默认开启；对命中订阅的编辑/新建，按精确修订 ID 分批读取主槽全文（每批最多20个），增加流量。与文本预览开关独立；失败或语法不确定时保留普通通知。关闭可减少请求量。",
+    "default": true
   },
   "change_include_bot_edits": {
     "description": "包含标记为机器人编辑的变更",

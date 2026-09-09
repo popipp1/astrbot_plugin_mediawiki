@@ -1,7 +1,7 @@
 name: astrbot_plugin_mediawiki
 display_name: MediaWiki 页面查询
 desc: 通过 MediaWiki Action API 查询页面，并监控单一条目或递归分类成员的编辑变更、差异和推送。
-version: 1.5.1
+version: 1.8.0
 author: Lukec
 repo: "https://github.com/popipp1/astrbot_plugin_mediawiki"
 astrbot_version: ">=4.16,<5"

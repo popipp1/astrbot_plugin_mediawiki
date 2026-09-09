@@ -408,6 +408,35 @@ class ResponseParsingTests(unittest.IsolatedAsyncioTestCase):
         diff = await client.compare_revisions(10, 11)
         self.assertIn("diff-addedline", diff)
 
+    async def test_revision_models_are_batched_and_revision_specific(self):
+        client = MediaWikiClient("https://example.org/w/api.php")
+        calls = []
+
+        async def fake_request(params):
+            calls.append(params)
+            return {'query': {'pages': [{'contentmodel': 'javascript', 'revisions': [
+                {'revid': int(rid), 'slots': {'main': {'contentmodel': 'wikitext'}}}
+                for rid in params['revids'].split('|')]}]}}
+
+        client._request = fake_request
+        result = await client.revision_content_models([*range(1, 53), 1, 0])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(result), 52)
+        self.assertEqual(result[1], 'wikitext')
+        self.assertEqual(calls[0]['rvprop'], 'ids|contentmodel')
+        self.assertEqual(calls[0]['rvslots'], 'main')
+        self.assertNotIn('titles', calls[0])
+
+    async def test_revision_models_unknown_and_legacy(self):
+        client = MediaWikiClient("https://example.org/w/api.php")
+        client._request = AsyncMock(return_value={'query': {'pages': [
+            {'revisions': [{'revid': 1, 'contentmodel': 'css'}, {'revid': 2}]}
+        ]}})
+        self.assertEqual(await client.revision_content_models([1, 2]), {1: 'css'})
+        client._request.reset_mock()
+        self.assertEqual(await client.revision_content_models([]), {})
+        client._request.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

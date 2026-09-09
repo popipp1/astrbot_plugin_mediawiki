@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest.mock import AsyncMock
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -153,8 +154,77 @@ class FakeClient:
         self.compare_calls += 1
         return '<td class="diff-addedline">==翻唱版本==</td>'
 
+    async def revision_content_models(self, revids):
+        return {revid: 'wikitext' for revid in revids}
+
+    async def revision_redirects(self, revids):
+        return {revid: '' for revid in revids}
+
+    async def page_ids_for_titles(self, titles):
+        return {title: 0 for title in titles}
+
 
 class MonitorWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_preview_has_no_notice_or_api_requests(self):
+        client = FakeClient()
+        client.revision_content_models = AsyncMock()
+        messages = []
+
+        async def sender(_umo, text):
+            messages.append(text)
+
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = WikiChangeMonitor(client, Path(directory) / 'state.json', sender, max_diff_lines=0)
+            await monitor.subscribe_page('aiocqhttp:group:1', sample_change().title)
+            await monitor.poll_once()
+        self.assertEqual(len(messages), 1)
+        self.assertNotIn('差异预览已关闭', messages[0])
+        self.assertIn('diff=', messages[0])
+        self.assertEqual(client.compare_calls, 0)
+        client.revision_content_models.assert_not_called()
+
+    async def test_unknown_content_model_preserves_literal_diff(self):
+        for mode in ('missing', 'failure', 'changed_model'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                client = FakeClient()
+                if mode == 'failure':
+                    client.revision_content_models = AsyncMock(side_effect=RuntimeError('temporary'))
+                else:
+                    models = {sample_change().revid: 'wikitext'} if mode == 'changed_model' else {}
+                    client.revision_content_models = AsyncMock(return_value=models)
+                client.compare_revisions = AsyncMock(return_value='<td class="diff-addedline">[[Category:A]]</td>')
+                messages = []
+
+                async def sender(_umo, text):
+                    messages.append(text)
+
+                monitor = WikiChangeMonitor(client, Path(directory) / 'state.json', sender)
+                await monitor.subscribe_page('aiocqhttp:group:1', sample_change().title)
+                if mode == 'failure':
+                    with self.assertLogs('change_monitor', level='WARNING'):
+                        await monitor.poll_once()
+                else:
+                    await monitor.poll_once()
+                self.assertIn('[[Category:A]]', messages[0])
+                self.assertNotIn('加入分类', messages[0])
+                self.assertNotIn('获取失败', messages[0])
+
+    async def test_compare_failure_still_notifies(self):
+        client = FakeClient()
+        client.compare_revisions = AsyncMock(side_effect=RuntimeError('temporary'))
+        messages = []
+
+        async def sender(_umo, text):
+            messages.append(text)
+
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = WikiChangeMonitor(client, Path(directory) / 'state.json', sender)
+            await monitor.subscribe_page('aiocqhttp:group:1', sample_change().title)
+            with self.assertLogs('change_monitor', level='ERROR'):
+                await monitor.poll_once()
+        self.assertIn('差异预览获取失败', messages[0])
+        self.assertIn('diff=', messages[0])
+
     async def test_category_lookup_failure_does_not_consume_new_page(self):
         client = FakeClient()
         client.changes = [
@@ -449,7 +519,7 @@ class MonitorWorkflowTests(unittest.IsolatedAsyncioTestCase):
             )
             state = await JsonStateStore(state_path).load()
 
-            self.assertEqual(state.version, 3)
+            self.assertEqual(state.version, 4)
             self.assertEqual(state.recent_rcids, [99])
             self.assertEqual(state.subscriptions[0].kind, SUBSCRIPTION_CATEGORY)
             self.assertEqual(state.subscriptions[0].target, "Category:SIFAC")
