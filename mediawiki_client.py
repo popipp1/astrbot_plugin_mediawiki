@@ -14,7 +14,7 @@ except ModuleNotFoundError:  # Allows pure helper tests before plugin deps are i
     aiohttp = None  # type: ignore[assignment]
 
 
-DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.5.0"
+DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.6.0"
 MAX_TITLES = 5
 
 
@@ -828,6 +828,25 @@ class MediaWikiClient:
             if isinstance(value, str):
                 return value
         return ""
+
+    async def revision_content_models(self, revids: list[int]) -> dict[int, str]:
+        """Read the model of exact revisions, never that of the latest page."""
+        ids = list(dict.fromkeys(value for value in revids if value > 0))
+        result: dict[int, str] = {}
+        for offset in range(0, len(ids), 50):
+            params = self._base_query_params()
+            params.update({"prop": "revisions", "revids": "|".join(map(str, ids[offset:offset + 50])),
+                           "rvprop": "ids|contentmodel", "rvslots": "main"})
+            data = await self._request(params)
+            query = data.get("query", {})
+            for page in _as_list(query.get("pages")):
+                for revision in _as_list(page.get("revisions")):
+                    slots = revision.get("slots", {})
+                    main = slots.get("main", {}) if isinstance(slots, dict) else {}
+                    model = main.get("contentmodel", revision.get("contentmodel", ""))
+                    if model:
+                        result[int(revision.get("revid", 0))] = str(model)
+        return result
 
     @staticmethod
     def _dangerous_special_pages(query: dict[str, Any]) -> tuple[set[str], str]:

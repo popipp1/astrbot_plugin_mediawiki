@@ -24,7 +24,7 @@
     "description": "HTTP User-Agent",
     "type": "string",
     "hint": "部分 Wiki 要求使用可识别的 User-Agent；建议包含机器人名称和联系方式。",
-    "default": "AstrBot-MediaWiki/1.5.0"
+    "default": "AstrBot-MediaWiki/1.6.0"
   },
   "timeout_seconds": {
     "description": "请求超时秒数",
@@ -117,7 +117,7 @@
   "change_diff_lines": {
     "description": "每条推送最多显示的差异项目数",
     "type": "int",
-    "hint": "修改前后作为一项；优先覆盖不同差异行。超出时显示省略提示，设为 0 时不请求差异。",
+    "hint": "先组合表格行、合并相同修改，再计算项目数；修改前后作为一项。超出时显示省略提示，设为 0 时不请求差异或内容模型，也不重复提示预览已关闭。",
     "default": 5
   },
   "change_diff_line_chars": {
@@ -129,8 +129,8 @@
   "change_message_max_chars": {
     "description": "单条监控消息最大字符数",
     "type": "int",
-    "hint": "包含标题、摘要、链接与差异，范围 500–5000。超出时按完整差异项目省略并提示。",
-    "default": 900
+    "hint": "包含标题、摘要、链接与差异，范围 500–5000，新安装默认 700。升级不覆盖已有配置，需更紧凑时手动改为 700。超出时按完整差异项目省略并提示。",
+    "default": 700
   },
   "change_pending_limit": {
     "description": "待发送通知队列上限",

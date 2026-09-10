@@ -7,7 +7,7 @@ import os
 import re
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
@@ -74,6 +74,18 @@ class DiffLine:
     action: str
     text: str
     replacement: str = ""
+    count: int = 1
+    positions: tuple[tuple[int | None, int | None], ...] = ()
+    # Complete pre-cropping identity; never deduplicate rendered/truncated text.
+    identity: tuple[str, ...] = ()
+    show_position: bool = False
+
+
+@dataclass(slots=True)
+class DiffRow:
+    cells: list[tuple[str, str, list[str], list[str]]]
+    old_line: int | None
+    new_line: int | None
 
 
 class _MediaWikiDiffParser(HTMLParser):
@@ -88,11 +100,16 @@ class _MediaWikiDiffParser(HTMLParser):
         self._mark_depth = 0
         self._parts: list[str] = []
         self._anchors: list[str] = []
+        self.rows: list[DiffRow] = []
+        self._old_line: int | None = None
+        self._new_line: int | None = None
+        self._line_column = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag == "tr":
             self._flush_row()
             self._in_row = True
+            self._line_column = 0
         if self._action:
             if tag == "td":
                 self._cell_depth += 1
@@ -111,6 +128,12 @@ class _MediaWikiDiffParser(HTMLParser):
             self._action = "add"
         elif "diff-deletedline" in class_names:
             self._action = "delete"
+        elif "diff-context" in class_names:
+            self._action = ("context-new" if "diff-side-added" in class_names
+                            else "context-old" if "diff-side-deleted" in class_names
+                            or not self._row else "context-new")
+        elif "diff-lineno" in class_names:
+            self._action = "lineno"
         if self._action:
             self._buffer = []
             self._cell_depth = 1
@@ -140,7 +163,16 @@ class _MediaWikiDiffParser(HTMLParser):
         if self._cell_depth > 0:
             return
         text = "".join(self._buffer)
-        self._row.append((self._action, text, self._parts, self._anchors))
+        if self._action == "lineno":
+            match = re.search(r"\d[\d,]*", text)
+            number = int(match.group().replace(',', '')) if match else None
+            if self._line_column == 0:
+                self._old_line = number
+            else:
+                self._new_line = number
+            self._line_column += 1
+        else:
+            self._row.append((self._action, text, self._parts, self._anchors))
         if not self._in_row:
             self._flush_row()
         self._action = ""
@@ -148,7 +180,14 @@ class _MediaWikiDiffParser(HTMLParser):
 
     def _flush_row(self) -> None:
         if self._row:
-            self.blocks.append(self._row)
+            self.rows.append(DiffRow(self._row, self._old_line, self._new_line))
+            changed = [cell for cell in self._row if cell[0] in {"add", "delete"}]
+            if changed:
+                self.blocks.append(changed)
+            if any(c[0] in {"delete", "context-old"} for c in self._row) and self._old_line is not None:
+                self._old_line += 1
+            if any(c[0] in {"add", "context-new"} for c in self._row) and self._new_line is not None:
+                self._new_line += 1
             self._row = []
 
     def close(self) -> None:
@@ -209,16 +248,21 @@ def _compact_pair(line: DiffLine) -> list[DiffLine]:
     ) for group in groups]
 
 
-def _diff_block(cells: list[tuple[str, str, list[str], list[str]]]) -> list[DiffLine]:
+def _diff_block(cells: list[tuple[str, str, list[str], list[str]]], *, structured: bool = True) -> list[DiffLine]:
     old = [cell for cell in cells if cell[0] == "delete"]
     new = [cell for cell in cells if cell[0] == "add"]
     if len(old) == len(new) == 1:
         before, after = old[0], new[0]
         if before[1] == after[1]:
             return [DiffLine("notice", "该行存在差异标记，但文本相同；请查看差异链接")]
-        links = _added_links(before[1], after[1])
+        links = _added_links(before[1], after[1]) if structured else None
         if links:
             return links
+        # MediaWiki emits no <del> span for a pure insertion. Verify the full
+        # unchanged remainder before turning marked tags into countable events.
+        if (structured and after[2] and ''.join(after[3]) == before[1]
+                and all(re.fullmatch(r'<br\s*/?>', part, re.I) for part in after[2])):
+            return [DiffLine('break_add', part) for part in after[2]]
         # Only pair marked spans when every unchanged anchor agrees.
         if before[2] and len(before[2]) == len(after[2]) and before[3] == after[3]:
             result = []
@@ -226,9 +270,19 @@ def _diff_block(cells: list[tuple[str, str, list[str], list[str]]]) -> list[Diff
                 if left == right:
                     continue
                 prefix, suffix = before[3][index], before[3][index + 1]
+                short_span = (min(len(left.strip()), len(right.strip())) <= 1
+                              or left.strip().isnumeric() or right.strip().isnumeric())
+                # A literal source tag is escaped in diff HTML. Count insertions,
+                # not all existing tags, and do not infer effects inside markup.
+                if (structured and not left and re.fullmatch(r"<br\s*/?>", right, re.I)
+                        and not re.search(r"<!--|nowiki|<pre|<source|<syntaxhighlight", before[1], re.I)):
+                    result.append(DiffLine("break_add", right))
+                    continue
                 # Keep syntax context for links, templates and punctuation edits.
                 if (any(token in before[1] for token in ('[[', '{{', '|'))
                         or not (left.strip() and right.strip())
+                        or min(len(left.strip()), len(right.strip())) <= 1
+                        or left.strip().isnumeric() or right.strip().isnumeric()
                         or not any(char.isalnum() for char in left + right)):
                     left = prefix[-24:] + left + suffix[:24]
                     right = prefix[-24:] + right + suffix[:24]
@@ -240,7 +294,7 @@ def _diff_block(cells: list[tuple[str, str, list[str], list[str]]]) -> list[Diff
                 elif not right:
                     result.append(DiffLine("delete", left))
                 else:
-                    result.append(DiffLine("replace", left, right))
+                    result.append(DiffLine("replace", left, right, show_position=short_span))
             if result:
                 return result
         # An aligned row is safe to show as before/after, not an inferred edit.
@@ -261,7 +315,7 @@ def _visible_diff(text: str, max_chars: int) -> str:
     return text if len(text) <= max_chars else text[:max_chars - 1] + "…"
 
 
-def _category_changes(blocks):
+def _category_changes(blocks, *, retain_rows=False):
     """Summarize explicit category-only source lines across the entire diff.
 
     Ambiguous markup falls back unchanged. This does not infer categories
@@ -300,7 +354,7 @@ def _category_changes(blocks):
             else:
                 residuals[action].append(text)
                 new_block.append((action, text, parts, anchors))
-        if new_block:
+        if new_block or retain_rows:
             cleaned.append(new_block)
     if not changed:
         return [], blocks
@@ -332,7 +386,7 @@ def _category_changes(blocks):
             lines.append('✏调整分类源码格式（已识别的分类及排序键未变）')
     left, right = ('\n'.join(residuals[side]) for side in ('delete', 'add'))
     if re.sub(r'\s', '', left) == re.sub(r'\s', '', right):
-        cleaned = []
+        cleaned = [[] for _ in blocks] if retain_rows else []
         if left != right:
             lines.append('…另有空白或换行调整')
     # Keep removals and additions together under both preview and message limits.
@@ -368,11 +422,137 @@ def _focus_pair(left: str, right: str, max_chars: int) -> tuple[str, str]:
     )
 
 
+def _table_cells(text: str) -> list[str] | None:
+    """Split only balanced, top-level || delimiters. Never interpret columns.
+
+    HTML, attributes, multiline cells and unusual syntax deliberately fall back
+    to an atomic source preview. Template parameters are not table delimiters.
+    """
+    if len(text) > 10000 or not text.startswith('|') or text.startswith(('|-', '|}')):
+        return None
+    if any(c in text for c in ('\n', '<', '>', '"', "'")):
+        return None
+    stack: list[str] = []
+    result: list[str] = []
+    start, index = 1, 1
+    while index < len(text):
+        token = next((x for x in ('{{{', '{{', '[[', '}}}', '}}', ']]')
+                      if text.startswith(x, index)), '')
+        if token in ('{{{', '{{', '[['):
+            stack.append({'{{{': '}}}', '{{': '}}', '[[': ']]'}[token])
+            index += len(token)
+        elif token:
+            # A sequence of four closing braces closes two nested templates.
+            if not stack or not text.startswith(stack[-1], index):
+                return None
+            index += len(stack.pop())
+        elif text[index] in '[]':
+            return None  # external links and unmatched brackets
+        elif not stack and text.startswith('||', index):
+            result.append(text[start:index].strip())
+            index += 2
+            start = index
+        elif not stack and text[index] in '|={}':
+            return None  # attributes/invalid syntax, not an ordinary cell value
+        else:
+            index += 1
+    if stack:
+        return None
+    result.append(text[start:].strip())
+    return result if len(result) > 1 else None
+
+
+def _event_blocks(rows: list[DiffRow], *, structured: bool) -> list[list[DiffLine]]:
+    blocks: list[list[DiffLine]] = []
+    index = 0
+    section = ''
+    # This is a conservative visible-context guard, not a full Wikitext parser.
+    template_depth = {'old': 0, 'new': 0}
+    while index < len(rows):
+        row = rows[index]
+        inside_template = any(template_depth.values())
+        for action, text, _parts, _anchors in row.cells:
+            if re.match(r'^={1,6}[^=].*?={1,6}\s*$', text):
+                section = text
+            side = 'old' if action in {'delete', 'context-old'} else 'new'
+            for token in re.findall(r'\{\{|\}\}', text):
+                template_depth[side] = max(0, template_depth[side] + (1 if token == '{{' else -1))
+        cells = [c for c in row.cells if c[0] in {'add', 'delete'}]
+        if not cells:
+            index += 1
+            continue
+        positions = ((row.old_line, row.new_line),)
+        # Only coalesce contiguous one-sided source rows beginning with a real
+        # table separator. Unchanged context and opposite-side edits are barriers.
+        if structured and not inside_template and len(cells) == 1 and cells[0][1].strip() == '|-':
+            action = cells[0][0]
+            source = []
+            end = index + 1
+            while end < len(rows):
+                following = rows[end]
+                if len(following.cells) != 1 or following.cells[0][0] != action:
+                    break
+                text = following.cells[0][1]
+                if not text.startswith(('|', '!')) or text.startswith(('|-', '|}')):
+                    break
+                source.append(text)
+                positions += ((following.old_line, following.new_line),)
+                end += 1
+            if source:
+                raw = '\n'.join(['|-', *source])
+                if (raw.count('{{') != raw.count('}}') or raw.count('[[') != raw.count(']]')):
+                    # A following separator could still be part of an unfinished
+                    # template. Fall back without consuming subsequent rows.
+                    source = []
+            if source:
+                values = _table_cells(source[0]) if len(source) == 1 else None
+                # No template expansion or inferred labels: expose intact cells.
+                preview = '｜'.join(value or '（空）' for value in values) if values else '\n'.join(source)
+                blocks.append([DiffLine('table_' + action, preview,
+                                        positions=positions, identity=(action, raw))])
+                index = end
+                continue
+        events = []
+        for event in _diff_block(cells, structured=structured):
+            identity = (event.action, event.text, event.replacement)
+            for fragment in _compact_pair(event):
+                # Cropped fragments keep their parent identity as well as their
+                # own text, so distinct long edits cannot collapse accidentally.
+                events.append(replace(fragment, positions=positions,
+                                      identity=(section,) + identity + (fragment.text, fragment.replacement)))
+        blocks.append(events)
+        index += 1
+    return blocks
+
+
+def _merge_repeated(blocks: list[list[DiffLine]]) -> list[list[DiffLine]]:
+    seen: dict[tuple[str, ...], tuple[int, int]] = {}
+    result: list[list[DiffLine]] = []
+    for block in blocks:
+        result.append([])
+        for event in block:
+            # Notices and table rows must not lose their separate structural role.
+            if event.action not in {'add', 'delete', 'replace', 'link_add', 'break_add'}:
+                result[-1].append(event)
+                continue
+            key = event.identity or (event.action, event.text, event.replacement)
+            if key in seen:
+                i, j = seen[key]
+                old = result[i][j]
+                result[i][j] = replace(old, count=old.count + event.count,
+                                       positions=old.positions + event.positions)
+            else:
+                seen[key] = (len(result) - 1, len(result[-1]))
+                result[-1].append(event)
+    return [block for block in result if block]
+
+
 def parse_diff_html(
     html: str,
     *,
     max_lines: int = 5,
     max_chars: int = 180,
+    content_model: str = "wikitext",
 ) -> list[DiffLine]:
     parser = _MediaWikiDiffParser()
     parser.feed(html or "")
@@ -381,9 +561,28 @@ def parse_diff_html(
     max_chars = max(20, min(int(max_chars), 1000))
     if not max_lines:
         return []
-    category_blocks, text_blocks = _category_changes(parser.blocks)
-    blocks = category_blocks + [[part for line in _diff_block(block) for part in _compact_pair(line)]
-                              for block in text_blocks]
+    source = '\n'.join(cell[1] for row in parser.rows for cell in row.cells)
+    structured = content_model == 'wikitext'
+    # Partial compare context may be inside a template or protected region.
+    # If visible context suggests that ambiguity, keep literal source previews.
+    protected = bool(re.search(r'<!--|-->|</?(?:nowiki|pre|source|syntaxhighlight)\b', source, re.I))
+    category_blocks, text_blocks = ([], parser.blocks)
+    if structured and not protected and '{{' not in source:
+        category_blocks, text_blocks = _category_changes(parser.blocks, retain_rows=True)
+    rows = parser.rows
+    if category_blocks:
+        # Preserve context and emptied category rows as structural barriers.
+        # Residual blocks align with changed rows, including empty blocks.
+        rows = []
+        residuals = iter(text_blocks)
+        for original in parser.rows:
+            if any(c[0] in {'add', 'delete'} for c in original.cells):
+                block = next(residuals)
+                context = [c for c in original.cells if c[0].startswith('context-')]
+                rows.append(DiffRow(context + block, original.old_line, original.new_line))
+            else:
+                rows.append(original)
+    blocks = _merge_repeated(category_blocks + _event_blocks(rows, structured=structured and not protected))
     # Reserve one preview for each row before spending the budget on details.
     selected: dict[int, list[DiffLine]] = {}
     remaining = max_lines
@@ -411,7 +610,7 @@ def parse_diff_html(
                 left = _visible_diff(left, min(max_chars, 60))
                 if right:
                     right = _visible_diff(right, min(max_chars, 60))
-            result.append(DiffLine(line.action, left, right))
+            result.append(replace(line, text=left, replacement=right))
     omitted = sum(len(block) for block in blocks) - len(result)
     if omitted:
         result.append(DiffLine("notice", f"另有 {omitted} 项差异未展示，详见差异链接"))
@@ -443,7 +642,7 @@ def format_change_notification(
     *,
     api_url: str,
     link_prefix: str = "",
-    max_message_chars: int = 900,
+    max_message_chars: int = 700,
 ) -> str:
     max_message_chars = max(500, min(int(max_message_chars), 5000))
     scope_text = "、".join(
@@ -485,24 +684,39 @@ def format_change_notification(
         lines.append(f"💬{_visible_diff(comment, 100)}")
     header_count = len(lines)
     for item in diff_lines:
+        count = f"（{item.count}处）" if item.count > 1 else ""
+        if item.action == 'break_add':
+            lines.append(f"✏添加换行标签{count}")
+            continue
+        if item.action in {'table_add', 'table_delete'}:
+            action = '新增' if item.action == 'table_add' else '删除'
+            lines.append(f"✏{action}表格行：{item.text}")
+            continue
         if item.action == 'category':
             lines.append(item.text)
             continue
         if item.action == "link_add":
             target = f"（目标：{item.replacement}）" if item.replacement else ""
-            lines.append(f"✏为｢{item.text}｣添加内链{target}")
+            lines.append(f"✏为｢{item.text}｣添加内链{target}{count}")
             continue
         if item.action == "notice":
             lines.append(f"…{item.text}")
             continue
         if item.action == "replace":
-            lines.append(f"✏把｢{item.text}｣改成｢{item.replacement}｣")
+            position = ''
+            if item.show_position and item.count == 1 and item.positions:
+                old_line, new_line = item.positions[0]
+                if new_line is not None:
+                    position = f'第{new_line}行：'
+                elif old_line is not None:
+                    position = f'原第{old_line}行：'
+            lines.append(f"✏{position}把｢{item.text}｣改成｢{item.replacement}｣{count}")
             continue
         if item.action == "before_after":
             lines.append(f"✏修改前｢{item.text}｣\n  修改后｢{item.replacement}｣")
             continue
         action = "添加" if item.action == "add" else "删除"
-        lines.append(f"✏{action}｢{item.text}｣")
+        lines.append(f"✏{action}｢{item.text}｣{count}")
     message = "\n".join(lines)
     if len(message) <= max_message_chars:
         if _redundant_category_comment(comment, diff_lines):
@@ -708,7 +922,7 @@ class WikiChangeMonitor:
         max_changes_per_poll: int = 1000,
         max_diff_lines: int = 5,
         max_diff_line_chars: int = 180,
-        max_message_chars: int = 900,
+        max_message_chars: int = 700,
         max_pending: int = 500,
         include_bot_edits: bool = True,
         overlap_seconds: int = 60,
@@ -995,6 +1209,19 @@ class WikiChangeMonitor:
             await self._learn_new_category_memberships(changes)
             result.fetched = len(changes)
             pending_keys = {item.key for item in self.state.pending}
+            models: dict[int, str] = {}
+            model_ids = list(dict.fromkeys(
+                revid for change in changes
+                if self.max_diff_lines and change.change_type != 'new'
+                and any((umo, change.rcid) not in pending_keys
+                        for umo in self._matching_targets(change, previous_members, update_titles=False))
+                for revid in (change.old_revid, change.revid) if revid > 0
+            ))
+            if model_ids:
+                try:
+                    models = await self.client.revision_content_models(model_ids)
+                except Exception:
+                    LOGGER.warning("Revision content models unavailable; using literal diff previews", exc_info=True)
             consumed: list[RecentChange] = []
             deferred_timestamps: list[str] = []
 
@@ -1016,10 +1243,7 @@ class WikiChangeMonitor:
                     )
                     break
                 result.matched += len(new_targets)
-                diff_lines: list[DiffLine] = (
-                    [] if change.change_type == "new"
-                    else [DiffLine("notice", "差异预览已关闭")]
-                )
+                diff_lines: list[DiffLine] = []
                 if new_targets and self.max_diff_lines and change.change_type != "new":
                     try:
                         diff_html = await self.client.compare_revisions(
@@ -1030,6 +1254,8 @@ class WikiChangeMonitor:
                             diff_html,
                             max_lines=self.max_diff_lines,
                             max_chars=self.max_diff_line_chars,
+                            content_model=('wikitext' if models.get(change.revid) == 'wikitext'
+                                           and models.get(change.old_revid) == 'wikitext' else 'unknown'),
                         )
                     except Exception:
                         diff_lines = [DiffLine("notice", "差异预览获取失败，请查看差异链接")]
@@ -1201,6 +1427,8 @@ class WikiChangeMonitor:
         previous_members: dict[
             tuple[str, str, str], tuple[set[int], set[str]]
         ],
+        *,
+        update_titles: bool = True,
     ) -> dict[str, list[str]]:
         targets: dict[str, list[str]] = {}
         for subscription in self.state.subscriptions:
@@ -1210,7 +1438,7 @@ class WikiChangeMonitor:
                     and subscription.page_id > 0
                     and change.pageid == subscription.page_id
                 ) or change.title.casefold() == subscription.target.casefold()
-                if matches and change.pageid == subscription.page_id and change.title:
+                if update_titles and matches and change.pageid == subscription.page_id and change.title:
                     subscription.target = change.title
             else:
                 previous_ids, previous_titles = previous_members.get(
