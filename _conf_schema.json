@@ -24,7 +24,7 @@
     "description": "HTTP User-Agent",
     "type": "string",
     "hint": "部分 Wiki 要求使用可识别的 User-Agent；建议包含机器人名称和联系方式。",
-    "default": "AstrBot-MediaWiki/1.4.0"
+    "default": "AstrBot-MediaWiki/1.4.1"
   },
   "timeout_seconds": {
     "description": "请求超时秒数",
@@ -118,6 +118,12 @@
     "description": "单条差异行最大字符数",
     "type": "int",
     "default": 180
+  },
+  "change_message_max_chars": {
+    "description": "单条监控消息最大字符数",
+    "type": "int",
+    "hint": "包含标题、摘要、链接与差异，范围 500–5000。超出时按完整差异项目省略并提示；建议搭配单条差异行 80–120 字符。",
+    "default": 900
   },
   "change_pending_limit": {
     "description": "待发送通知队列上限",

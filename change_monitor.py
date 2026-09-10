@@ -204,6 +204,25 @@ def _visible_diff(text: str, max_chars: int) -> str:
     return text if len(text) <= max_chars else text[:max_chars - 1] + "…"
 
 
+def _focus_pair(left: str, right: str, max_chars: int) -> tuple[str, str]:
+    """Discard shared distant context before truncating a long aligned pair."""
+    if max(len(left), len(right)) <= max_chars or left == right:
+        return left, right
+    prefix = 0
+    while prefix < min(len(left), len(right)) and left[prefix] == right[prefix]:
+        prefix += 1
+    suffix = 0
+    while (suffix < min(len(left), len(right)) - prefix
+           and left[len(left) - suffix - 1] == right[len(right) - suffix - 1]):
+        suffix += 1
+    start = max(0, prefix - 20)
+    trim = max(0, suffix - 20)
+    return tuple(
+        ('…' if start else '') + value[start:len(value) - trim]
+        + ('…' if trim else '') for value in (left, right)
+    )
+
+
 def parse_diff_html(
     html: str,
     *,
@@ -229,12 +248,14 @@ def parse_diff_html(
         extra = blocks[index][1:1 + remaining]
         selected[index].extend(extra)
         remaining -= len(extra)
-    result = [
-        DiffLine(line.action, _visible_diff(line.text, max_chars),
-                 _visible_diff(line.replacement, max_chars)
-                 if line.action in {"replace", "before_after"} else "")
-        for block in selected.values() for line in block
-    ]
+    result = []
+    for block in selected.values():
+        for line in block:
+            left, right = line.text, line.replacement
+            if line.action in {"replace", "before_after"}:
+                left, right = _focus_pair(left, right, max_chars)
+                right = _visible_diff(right, max_chars)
+            result.append(DiffLine(line.action, _visible_diff(left, max_chars), right))
     omitted = sum(len(block) for block in blocks) - len(result)
     if omitted:
         result.append(DiffLine("notice", f"另有 {omitted} 项差异未展示，详见差异链接"))
@@ -266,7 +287,9 @@ def format_change_notification(
     *,
     api_url: str,
     link_prefix: str = "",
+    max_message_chars: int = 900,
 ) -> str:
+    max_message_chars = max(500, min(int(max_message_chars), 5000))
     scope_text = "、".join(
         display_category(item) if item.casefold().startswith("category:") else item
         for item in scopes if not item.startswith("单条目：")
@@ -289,14 +312,15 @@ def format_change_notification(
         title += f" § {section.group(1)[:100]}"
         comment = comment[section.end():]
     lines = [
-        title,
-        f"{delta}{flags} | {change.user} | {_local_clock(change.timestamp)}",
+        _visible_diff(title, 140),
+        f"{delta}{flags} | {_visible_diff(change.user, 60)} | {_local_clock(change.timestamp)}",
     ]
     if scope_text:
-        lines.append(f"订阅：{scope_text[:200]}")
+        lines.append(f"订阅：{_visible_diff(scope_text, 80)}")
     lines.append(link)
     if comment:
-        lines.append(f"💬{_visible_diff(comment, 300)}")
+        lines.append(f"💬{_visible_diff(comment, 100)}")
+    header_count = len(lines)
     for item in diff_lines:
         if item.action == "notice":
             lines.append(f"…{item.text}")
@@ -309,7 +333,29 @@ def format_change_notification(
             continue
         action = "添加" if item.action == "add" else "删除"
         lines.append(f"✏{action}｢{item.text}｣")
-    return "\n".join(lines)
+    message = "\n".join(lines)
+    if len(message) <= max_message_chars:
+        return message
+    footer = "…消息长度已限制，完整差异请查看链接"
+    header = lines[:header_count]
+    # Preserve the URL and metadata; summaries and subscription labels are optional.
+    while len('\n'.join(header)) + len(footer) + 1 > max_message_chars and len(header) > 3:
+        optional = next((i for i, value in enumerate(header)
+                         if value.startswith(('订阅：', '💬'))), None)
+        if optional is None:
+            break
+        header.pop(optional)
+    # Extremely long custom API URLs still obey the configured hard cap.
+    base = '\n'.join(header)
+    if len(base) + len(footer) + 1 > max_message_chars:
+        return base[:max_message_chars - len(footer) - 2] + '…\n' + footer
+    accepted = header[:]
+    for entry in lines[header_count:]:
+        if len('\n'.join([*accepted, entry, footer])) <= max_message_chars:
+            accepted.append(entry)
+        else:
+            break
+    return '\n'.join([*accepted, footer])
 
 
 @dataclass(slots=True)
@@ -477,6 +523,7 @@ class WikiChangeMonitor:
         max_changes_per_poll: int = 1000,
         max_diff_lines: int = 5,
         max_diff_line_chars: int = 180,
+        max_message_chars: int = 900,
         max_pending: int = 500,
         include_bot_edits: bool = True,
         overlap_seconds: int = 60,
@@ -493,6 +540,7 @@ class WikiChangeMonitor:
         self.max_changes_per_poll = max(1, min(int(max_changes_per_poll), 10_000))
         self.max_diff_lines = max(0, min(int(max_diff_lines), 50))
         self.max_diff_line_chars = max(20, min(int(max_diff_line_chars), 1000))
+        self.max_message_chars = max(500, min(int(max_message_chars), 5000))
         self.max_pending = max(1, min(int(max_pending), 10_000))
         self.include_bot_edits = include_bot_edits
         self.overlap_seconds = max(0, min(int(overlap_seconds), 600))
@@ -792,6 +840,7 @@ class WikiChangeMonitor:
                         diff_lines,
                         api_url=self.client.api_url,
                         link_prefix=self.link_prefix_for_umo(umo),
+                        max_message_chars=self.max_message_chars,
                     )
                     pending = PendingNotification(umo, change.rcid, message)
                     self.state.pending.append(pending)
