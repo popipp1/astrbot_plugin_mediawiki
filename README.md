@@ -14,6 +14,7 @@
 - 订阅某个分类及其子分类中的页面编辑，定时主动推送到当前群聊或私聊
 - 推送编辑者、字节变化、编辑时间、差异链接与逐行增删预览
 - 首次订阅跳过历史，持久化时间水位、分类成员快照和发送失败队列
+- 支持使用 MediaWiki Bot Password 登录受限 API，并在登录失效后自动重登一次
 - 对未安装 TextExtracts 扩展的 Wiki 自动退化为仅返回页面信息
 - 避免 `Special:MyPage`、`Special:MyTalk` 等特殊页暴露请求端身份
 
@@ -29,6 +30,23 @@ https://www.mediawiki.org/w/api.php
 ```
 
 地址必须以 `/api.php` 结尾。部分站点要求使用指定 User-Agent，请同时修改 `user_agent`。
+
+### 萌娘百科等禁止匿名 API 的站点
+
+若查询返回 `action-notallowed: Unauthorized API call`，需要在该 Wiki 登录后打开
+`Special:BotPasswords` 创建一个专用于本插件的 Bot Password，然后在 AstrBot 插件配置中填写：
+
+```text
+api_url=https://zh.moegirl.org.cn/api.php
+api_username=你的账号名@机器人名
+api_bot_password=Special:BotPasswords 生成的密码
+```
+
+请填写 Bot Password，不要填写账号主密码。插件通过同一个 HTTP 会话先获取登录令牌，
+再用 POST 登录；查询时不会把密码放入 URL 或日志。AstrBot 会将插件配置保存在本机
+`data/config`，请限制该目录的访问权限。保存配置后重新加载插件，再用 `/wiki 页面名`
+验证。若站点 WAF 对主域名不稳定，也可以尝试把 `api_url` 改为
+`https://mzh.moegirl.org.cn/api.php`，但登录仍是更可靠的方案。
 
 ## 指令
 

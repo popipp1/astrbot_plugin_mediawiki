@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ except ModuleNotFoundError:  # Allows pure helper tests before plugin deps are i
     aiohttp = None  # type: ignore[assignment]
 
 
-DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.2"
+DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.2.1"
 MAX_TITLES = 5
 
 
@@ -33,6 +34,10 @@ class MediaWikiAPIError(MediaWikiError):
         self.code = code
         self.info = info
         self.payload = payload or {}
+
+
+class MediaWikiAuthenticationError(MediaWikiAPIError):
+    """The configured MediaWiki Bot Password could not authenticate."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -190,19 +195,30 @@ class MediaWikiClient:
         user_agent: str = DEFAULT_USER_AGENT,
         timeout_seconds: float = 12,
         summary_chars: int = 200,
+        username: str = "",
+        bot_password: str = "",
     ) -> None:
         self.api_url = validate_api_url(api_url)
         self.index_url = get_index_url(self.api_url)
         self.user_agent = user_agent.strip() or DEFAULT_USER_AGENT
         self.timeout_seconds = max(3.0, min(float(timeout_seconds), 60.0))
         self.summary_chars = max(50, min(int(summary_chars), 1200))
+        self.username = username.strip()
+        self._bot_password = bot_password.strip()
         self._session: aiohttp.ClientSession | None = None
         self._extracts_supported = True
+        self._authenticated = False
+        self._login_lock = asyncio.Lock()
+
+    @property
+    def authentication_configured(self) -> bool:
+        return bool(self.username and self._bot_password)
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+        self._authenticated = False
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if aiohttp is None:
@@ -218,10 +234,46 @@ class MediaWikiClient:
             )
         return self._session
 
-    async def _request(self, params: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _raise_for_api_errors(data: dict[str, Any]) -> None:
+        if error := data.get("error"):
+            if not isinstance(error, dict):
+                raise MediaWikiAPIError("unknown", str(error))
+            raise MediaWikiAPIError(
+                str(error.get("code", "unknown")),
+                str(error.get("info", "Wiki API 请求失败")),
+                error,
+            )
+
+        errors = data.get("errors")
+        if not errors:
+            return
+        first = next(
+            (item for item in _as_list(errors) if isinstance(item, dict)),
+            None,
+        )
+        if first:
+            info = first.get("text") or first.get("info") or first.get("html")
+            raise MediaWikiAPIError(
+                str(first.get("code", "errors")),
+                str(info or "Wiki API 请求失败"),
+                {"errors": errors},
+            )
+        raise MediaWikiAPIError(
+            "errors", json.dumps(errors, ensure_ascii=False), {"errors": errors}
+        )
+
+    async def _http_json(
+        self, params: dict[str, Any], *, post: bool = False
+    ) -> dict[str, Any]:
         session = await self._get_session()
         try:
-            async with session.get(self.api_url, params=params) as response:
+            request = (
+                session.post(self.api_url, data=params)
+                if post
+                else session.get(self.api_url, params=params)
+            )
+            async with request as response:
                 body = await response.text()
                 if response.status < 200 or response.status >= 300:
                     excerpt = re.sub(r"\s+", " ", body).strip()[:300]
@@ -238,17 +290,93 @@ class MediaWikiClient:
 
         if not isinstance(data, dict):
             raise MediaWikiHTTPError("Wiki API 返回了无法识别的数据")
-        if error := data.get("error"):
-            if not isinstance(error, dict):
-                raise MediaWikiAPIError("unknown", str(error))
-            raise MediaWikiAPIError(
-                str(error.get("code", "unknown")),
-                str(error.get("info", "Wiki API 请求失败")),
-                error,
-            )
-        if errors := data.get("errors"):
-            raise MediaWikiAPIError("errors", json.dumps(errors, ensure_ascii=False))
+        self._raise_for_api_errors(data)
         return data
+
+    async def ensure_authenticated(self) -> bool:
+        """Log in with a MediaWiki Bot Password when credentials are configured."""
+        if not self.username and not self._bot_password:
+            return False
+        if not self.username or not self._bot_password:
+            raise MediaWikiAuthenticationError(
+                "credentials-incomplete",
+                "Bot Password 登录名和密码必须同时填写",
+            )
+        if self._authenticated:
+            return True
+
+        async with self._login_lock:
+            if self._authenticated:
+                return True
+            token_data = await self._http_json(
+                {
+                    "action": "query",
+                    "meta": "tokens",
+                    "type": "login",
+                    "format": "json",
+                    "formatversion": "2",
+                    "errorformat": "plaintext",
+                    "utf8": "1",
+                }
+            )
+            query = token_data.get("query")
+            tokens = query.get("tokens") if isinstance(query, dict) else None
+            token = (
+                str(tokens.get("logintoken", ""))
+                if isinstance(tokens, dict)
+                else ""
+            )
+            if not token:
+                raise MediaWikiAuthenticationError(
+                    "login-token-missing", "Wiki API 没有返回登录令牌"
+                )
+
+            login_data = await self._http_json(
+                {
+                    "action": "login",
+                    "lgname": self.username,
+                    "lgpassword": self._bot_password,
+                    "lgtoken": token,
+                    "format": "json",
+                    "formatversion": "2",
+                    "errorformat": "plaintext",
+                    "utf8": "1",
+                },
+                post=True,
+            )
+            login = login_data.get("login")
+            result = str(login.get("result", "")) if isinstance(login, dict) else ""
+            if result.casefold() != "success":
+                reason = (
+                    str(login.get("reason") or login.get("message") or result)
+                    if isinstance(login, dict)
+                    else "Wiki API 没有返回登录结果"
+                )
+                raise MediaWikiAuthenticationError(
+                    "login-failed", reason or "Bot Password 登录失败"
+                )
+            self._authenticated = True
+            return True
+
+    async def _request(self, params: dict[str, Any]) -> dict[str, Any]:
+        authenticated = await self.ensure_authenticated()
+        request_params = dict(params)
+        if authenticated:
+            request_params.setdefault("assert", "user")
+        try:
+            return await self._http_json(request_params)
+        except MediaWikiAPIError as exc:
+            if not authenticated or exc.code not in {
+                "assertuserfailed",
+                "notloggedin",
+            }:
+                raise
+
+        # Cookies may have expired while AstrBot stayed online. Recreate the
+        # login session once and retry the original request.
+        self._authenticated = False
+        await self.ensure_authenticated()
+        return await self._http_json(request_params)
 
     @staticmethod
     def _without_extracts(params: dict[str, Any]) -> dict[str, Any]:

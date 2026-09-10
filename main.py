@@ -36,7 +36,7 @@ from .mediawiki_client import (
     "astrbot_plugin_mediawiki",
     "Lukec",
     "MediaWiki 页面查询与分类变更推送",
-    "1.2.0",
+    "1.2.1",
 )
 class MediaWikiPlugin(Star):
     """Query page summaries and links through the MediaWiki Action API."""
@@ -57,9 +57,11 @@ class MediaWikiPlugin(Star):
 
         self.client = MediaWikiClient(
             str(config.get("api_url", "https://zh.wikipedia.org/w/api.php")),
-            user_agent=str(config.get("user_agent", "AstrBot-MediaWiki/1.2")),
+            user_agent=str(config.get("user_agent", "AstrBot-MediaWiki/1.2.1")),
             timeout_seconds=float(config.get("timeout_seconds", 12)),
             summary_chars=int(config.get("summary_chars", 200)),
+            username=str(config.get("api_username", "")),
+            bot_password=str(config.get("api_bot_password", "")),
         )
         state_path = (
             Path(get_astrbot_plugin_data_path())
@@ -398,8 +400,30 @@ class MediaWikiPlugin(Star):
             r"(?<!\S)(https?://\S+)", rf"{self.qq_link_prefix}\1", text
         )
 
-    @staticmethod
-    def _friendly_error(exc: MediaWikiError) -> str:
+    def _friendly_error(self, exc: MediaWikiError) -> str:
         if isinstance(exc, MediaWikiAPIError) and exc.code == "maxlag":
             return "Wiki 服务器繁忙，请稍后重试。"
+        if isinstance(exc, MediaWikiAPIError) and exc.code == "action-notallowed":
+            if self.client.authentication_configured:
+                return (
+                    "Wiki 拒绝了已登录账号的 API 请求；请检查 Bot Password "
+                    "登录名、密码及授权范围。"
+                )
+            return (
+                "该 Wiki 禁止匿名 API 查询。请在插件配置中填写通过 "
+                "Special:BotPasswords 创建的登录名和 Bot Password；"
+                "不要填写账号主密码。"
+            )
+        if isinstance(exc, MediaWikiAPIError) and exc.code in {
+            "credentials-incomplete",
+            "login-token-missing",
+            "login-failed",
+            "assertuserfailed",
+            "notloggedin",
+        }:
+            return (
+                "Bot Password 登录失败："
+                f"{exc.info}。请检查登录名（通常为 账号名@机器人名）和密码；"
+                "不要填写账号主密码。"
+            )
         return str(exc)

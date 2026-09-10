@@ -6,11 +6,25 @@
     "obvious_hint": true,
     "default": "https://zh.wikipedia.org/w/api.php"
   },
+  "api_username": {
+    "description": "MediaWiki Bot Password 登录名",
+    "type": "string",
+    "hint": "站点禁止匿名 API 时填写。通常为“账号名@机器人名”；与下方密码必须同时填写。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "api_bot_password": {
+    "description": "MediaWiki Bot Password（非账号主密码）",
+    "type": "string",
+    "hint": "在目标 Wiki 的 Special:BotPasswords 创建。AstrBot 会把配置保存在本机 data/config，请保护该文件且不要填写账号主密码。",
+    "obvious_hint": true,
+    "default": ""
+  },
   "user_agent": {
     "description": "HTTP User-Agent",
     "type": "string",
     "hint": "部分 Wiki 要求使用可识别的 User-Agent；建议包含机器人名称和联系方式。",
-    "default": "AstrBot-MediaWiki/1.2"
+    "default": "AstrBot-MediaWiki/1.2.1"
   },
   "timeout_seconds": {
     "description": "请求超时秒数",
