@@ -9,6 +9,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -155,6 +156,59 @@ class _MediaWikiDiffParser(HTMLParser):
         self._flush_row()
 
 
+def _added_links(old: str, new: str) -> list[DiffLine] | None:
+    """Recognize only exact plain-text-to-link conversions, preserving all else."""
+    if any(token in old + new for token in ('<', '>', '<!--')):
+        return None
+    old_pos = new_pos = 0
+    result = []
+    for match in re.finditer(r'\[\[([^\[\]\n]+)\]\]', new):
+        unchanged = new[new_pos:match.start()]
+        if not old.startswith(unchanged, old_pos):
+            return None
+        old_pos += len(unchanged)
+        literal = match.group(0)
+        if old.startswith(literal, old_pos):
+            old_pos += len(literal)
+        else:
+            parts = match.group(1).split('|')
+            if len(parts) > 2:
+                return None
+            target = parts[0]
+            label = parts[-1]
+            # Namespaced links may embed files or assign categories.
+            if not label or ':' in target or not old.startswith(label, old_pos):
+                return None
+            old_pos += len(label)
+            result.append(DiffLine('link_add', label, target if target != label else ''))
+        new_pos = match.end()
+    if not result or old[old_pos:] != new[new_pos:]:
+        return None
+    return result
+
+
+def _compact_pair(line: DiffLine) -> list[DiffLine]:
+    if line.action not in {'replace', 'before_after'}:
+        return [line]
+    left, right = line.text, line.replacement
+    if max(len(left), len(right)) <= 120:
+        return [line]
+    # Bound sequence matching work for exceptionally large revision rows.
+    if max(len(left), len(right)) > 2000:
+        return [line]
+    groups = list(SequenceMatcher(None, left, right, autojunk=False)
+                  .get_grouped_opcodes(12))
+    if not groups:
+        return [line]
+    return [DiffLine(
+        'before_after',
+        ('…' if group[0][1] else '') + left[group[0][1]:group[-1][2]]
+        + ('…' if group[-1][2] < len(left) else ''),
+        ('…' if group[0][3] else '') + right[group[0][3]:group[-1][4]]
+        + ('…' if group[-1][4] < len(right) else ''),
+    ) for group in groups]
+
+
 def _diff_block(cells: list[tuple[str, str, list[str], list[str]]]) -> list[DiffLine]:
     old = [cell for cell in cells if cell[0] == "delete"]
     new = [cell for cell in cells if cell[0] == "add"]
@@ -162,6 +216,9 @@ def _diff_block(cells: list[tuple[str, str, list[str], list[str]]]) -> list[Diff
         before, after = old[0], new[0]
         if before[1] == after[1]:
             return [DiffLine("notice", "该行存在差异标记，但文本相同；请查看差异链接")]
+        links = _added_links(before[1], after[1])
+        if links:
+            return links
         # Only pair marked spans when every unchanged anchor agrees.
         if before[2] and len(before[2]) == len(after[2]) and before[3] == after[3]:
             result = []
@@ -236,7 +293,8 @@ def parse_diff_html(
     max_chars = max(20, min(int(max_chars), 1000))
     if not max_lines:
         return []
-    blocks = [_diff_block(block) for block in parser.blocks]
+    blocks = [[part for line in _diff_block(block) for part in _compact_pair(line)]
+              for block in parser.blocks]
     # Reserve one preview for each row before spending the budget on details.
     selected: dict[int, list[DiffLine]] = {}
     remaining = max_lines
@@ -253,9 +311,15 @@ def parse_diff_html(
         for line in block:
             left, right = line.text, line.replacement
             if line.action in {"replace", "before_after"}:
-                left, right = _focus_pair(left, right, max_chars)
-                right = _visible_diff(right, max_chars)
-            result.append(DiffLine(line.action, _visible_diff(left, max_chars), right))
+                pair_chars = min(max_chars, 60)
+                left, right = _focus_pair(left, right, pair_chars)
+                right = _visible_diff(right, pair_chars)
+                left = _visible_diff(left, pair_chars)
+            else:
+                left = _visible_diff(left, min(max_chars, 60))
+                if right:
+                    right = _visible_diff(right, min(max_chars, 60))
+            result.append(DiffLine(line.action, left, right))
     omitted = sum(len(block) for block in blocks) - len(result)
     if omitted:
         result.append(DiffLine("notice", f"另有 {omitted} 项差异未展示，详见差异链接"))
@@ -322,6 +386,10 @@ def format_change_notification(
         lines.append(f"💬{_visible_diff(comment, 100)}")
     header_count = len(lines)
     for item in diff_lines:
+        if item.action == "link_add":
+            target = f"（目标：{item.replacement}）" if item.replacement else ""
+            lines.append(f"✏为｢{item.text}｣添加内链{target}")
+            continue
         if item.action == "notice":
             lines.append(f"…{item.text}")
             continue
@@ -823,7 +891,8 @@ class WikiChangeMonitor:
                         diff_html = await self.client.compare_revisions(
                             change.old_revid, change.revid
                         )
-                        diff_lines = parse_diff_html(
+                        diff_lines = await asyncio.to_thread(
+                            parse_diff_html,
                             diff_html,
                             max_lines=self.max_diff_lines,
                             max_chars=self.max_diff_line_chars,

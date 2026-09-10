@@ -14,7 +14,7 @@ except ModuleNotFoundError:  # Allows pure helper tests before plugin deps are i
     aiohttp = None  # type: ignore[assignment]
 
 
-DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.4.1"
+DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.4.2"
 MAX_TITLES = 5
 
 
