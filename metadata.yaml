@@ -1,0 +1,7 @@
+name: astrbot_plugin_mediawiki
+display_name: MediaWiki 页面查询
+desc: 通过 MediaWiki Action API 返回页面摘要、规范链接、重定向和搜索结果。
+version: 1.1.0
+author: Lukec
+repo: ""
+astrbot_version: ">=4.16,<5"

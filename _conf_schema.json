@@ -1,0 +1,49 @@
+{
+  "api_url": {
+    "description": "MediaWiki API 地址",
+    "type": "string",
+    "hint": "必须是以 /api.php 结尾的完整 http/https 地址。",
+    "obvious_hint": true,
+    "default": "https://zh.wikipedia.org/w/api.php"
+  },
+  "user_agent": {
+    "description": "HTTP User-Agent",
+    "type": "string",
+    "hint": "部分 Wiki 要求使用可识别的 User-Agent；建议包含机器人名称和联系方式。",
+    "default": "AstrBot-MediaWiki/1.0"
+  },
+  "timeout_seconds": {
+    "description": "请求超时秒数",
+    "type": "int",
+    "default": 12
+  },
+  "summary_chars": {
+    "description": "摘要最大字符数",
+    "type": "int",
+    "hint": "MediaWiki TextExtracts 支持 50–1200，本插件会自动限制到该范围。",
+    "default": 200
+  },
+  "show_summary": {
+    "description": "默认显示页面摘要",
+    "type": "bool",
+    "default": true
+  },
+  "search_if_missing": {
+    "description": "页面不存在时默认搜索",
+    "type": "bool",
+    "hint": "也可以在单次查询中使用 -s 或 --search。",
+    "default": false
+  },
+  "auto_expand_brackets": {
+    "description": "未 @ 机器人时也自动展开 [[页面名]]",
+    "type": "bool",
+    "hint": "@机器人 [[页面名]] 始终生效；启用本项后，没有 @ 机器人的普通消息也会触发查询。",
+    "default": false
+  },
+  "qq_link_prefix": {
+    "description": "QQ 链接前缀",
+    "type": "string",
+    "hint": "通常留空。若 OneBot 无法发送链接，可填写 #；仅对 aiocqhttp/OneBot 生效。",
+    "default": ""
+  }
+}
