@@ -24,7 +24,7 @@
     "description": "HTTP User-Agent",
     "type": "string",
     "hint": "部分 Wiki 要求使用可识别的 User-Agent；建议包含机器人名称和联系方式。",
-    "default": "AstrBot-MediaWiki/1.3.1"
+    "default": "AstrBot-MediaWiki/1.4.0"
   },
   "timeout_seconds": {
     "description": "请求超时秒数",
@@ -109,9 +109,9 @@
     "default": 20000
   },
   "change_diff_lines": {
-    "description": "每条推送最多显示的差异行数",
+    "description": "每条推送最多显示的差异项目数",
     "type": "int",
-    "hint": "设为 0 时不请求和显示逐行差异。",
+    "hint": "修改前后作为一项；优先覆盖不同差异行。超出时显示省略提示，设为 0 时不请求差异。",
     "default": 5
   },
   "change_diff_line_chars": {

@@ -41,7 +41,7 @@ from .mediawiki_client import (
     "astrbot_plugin_mediawiki",
     "Lukec",
     "MediaWiki 页面查询与条目/分类变更推送",
-    "1.3.1",
+    "1.4.0",
 )
 class MediaWikiPlugin(Star):
     """Query page summaries and links through the MediaWiki Action API."""
@@ -64,7 +64,7 @@ class MediaWikiPlugin(Star):
 
         self.client = MediaWikiClient(
             str(config.get("api_url", "https://zh.wikipedia.org/w/api.php")),
-            user_agent=str(config.get("user_agent", "AstrBot-MediaWiki/1.3.1")),
+            user_agent=str(config.get("user_agent", "AstrBot-MediaWiki/1.4.0")),
             timeout_seconds=float(config.get("timeout_seconds", 12)),
             summary_chars=int(config.get("summary_chars", 200)),
             username=str(config.get("api_username", "")),

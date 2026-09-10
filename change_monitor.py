@@ -72,20 +72,35 @@ def overlap_timestamp(timestamp: str, seconds: int) -> str:
 class DiffLine:
     action: str
     text: str
+    replacement: str = ""
 
 
 class _MediaWikiDiffParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.lines: list[DiffLine] = []
         self._action = ""
         self._buffer: list[str] = []
         self._cell_depth = 0
+        self.blocks: list[list[tuple[str, str, list[str], list[str]]]] = []
+        self._row: list[tuple[str, str, list[str], list[str]]] = []
+        self._in_row = False
+        self._mark_depth = 0
+        self._parts: list[str] = []
+        self._anchors: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "tr":
+            self._flush_row()
+            self._in_row = True
         if self._action:
             if tag == "td":
                 self._cell_depth += 1
+            if tag in {"ins", "del"}:
+                if not self._mark_depth:
+                    self._parts.append("")
+                self._mark_depth += 1
+            if tag == "br":
+                self.handle_data("\n")
             return
         if tag != "td":
             return
@@ -98,22 +113,95 @@ class _MediaWikiDiffParser(HTMLParser):
         if self._action:
             self._buffer = []
             self._cell_depth = 1
+            self._mark_depth = 0
+            self._parts = []
+            self._anchors = [""]
 
     def handle_data(self, data: str) -> None:
         if self._action:
             self._buffer.append(data)
+            if self._mark_depth:
+                self._parts[-1] += data
+            else:
+                self._anchors[-1] += data
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "tr":
+            self._flush_row()
+            self._in_row = False
+        if self._action and tag in {"ins", "del"} and self._mark_depth:
+            self._mark_depth -= 1
+            if not self._mark_depth:
+                self._anchors.append("")
         if not self._action or tag != "td":
             return
         self._cell_depth -= 1
         if self._cell_depth > 0:
             return
-        text = re.sub(r"\s+", " ", "".join(self._buffer)).strip()
-        if text:
-            self.lines.append(DiffLine(self._action, text))
+        text = "".join(self._buffer)
+        self._row.append((self._action, text, self._parts, self._anchors))
+        if not self._in_row:
+            self._flush_row()
         self._action = ""
         self._buffer = []
+
+    def _flush_row(self) -> None:
+        if self._row:
+            self.blocks.append(self._row)
+            self._row = []
+
+    def close(self) -> None:
+        super().close()
+        self._flush_row()
+
+
+def _diff_block(cells: list[tuple[str, str, list[str], list[str]]]) -> list[DiffLine]:
+    old = [cell for cell in cells if cell[0] == "delete"]
+    new = [cell for cell in cells if cell[0] == "add"]
+    if len(old) == len(new) == 1:
+        before, after = old[0], new[0]
+        if before[1] == after[1]:
+            return [DiffLine("notice", "该行存在差异标记，但文本相同；请查看差异链接")]
+        # Only pair marked spans when every unchanged anchor agrees.
+        if before[2] and len(before[2]) == len(after[2]) and before[3] == after[3]:
+            result = []
+            for index, (left, right) in enumerate(zip(before[2], after[2])):
+                if left == right:
+                    continue
+                prefix, suffix = before[3][index], before[3][index + 1]
+                # Keep syntax context for links, templates and punctuation edits.
+                if (any(token in before[1] for token in ('[[', '{{', '|'))
+                        or not (left.strip() and right.strip())
+                        or not any(char.isalnum() for char in left + right)):
+                    left = prefix[-24:] + left + suffix[:24]
+                    right = prefix[-24:] + right + suffix[:24]
+                    if re.sub(r'\s', '', left) == re.sub(r'\s', '', right):
+                        left = left.replace(' ', '␠').replace('\t', '⇥')
+                        right = right.replace(' ', '␠').replace('\t', '⇥')
+                if not left:
+                    result.append(DiffLine("add", right))
+                elif not right:
+                    result.append(DiffLine("delete", left))
+                else:
+                    result.append(DiffLine("replace", left, right))
+            if result:
+                return result
+        # An aligned row is safe to show as before/after, not an inferred edit.
+        left, right = before[1], after[1]
+        if re.sub(r'\s', '', left) == re.sub(r'\s', '', right):
+            left = left.replace(' ', '␠').replace('\t', '⇥')
+            right = right.replace(' ', '␠').replace('\t', '⇥')
+        return [DiffLine("before_after", left, right)]
+    return [DiffLine(action, text) for action, text, _parts, _anchors in cells]
+
+
+def _visible_diff(text: str, max_chars: int) -> str:
+    if not text:
+        return "（空行）"
+    if not text.strip():
+        text = text.replace(" ", "␠").replace("\t", "⇥")
+    text = text.replace("\r", "␍").replace("\n", "↵")
+    return text if len(text) <= max_chars else text[:max_chars - 1] + "…"
 
 
 def parse_diff_html(
@@ -127,12 +215,31 @@ def parse_diff_html(
     parser.close()
     max_lines = max(0, min(int(max_lines), 50))
     max_chars = max(20, min(int(max_chars), 1000))
-    result: list[DiffLine] = []
-    for line in parser.lines[:max_lines]:
-        text = line.text
-        if len(text) > max_chars:
-            text = text[: max_chars - 1].rstrip() + "…"
-        result.append(DiffLine(line.action, text))
+    if not max_lines:
+        return []
+    blocks = [_diff_block(block) for block in parser.blocks]
+    # Reserve one preview for each row before spending the budget on details.
+    selected: dict[int, list[DiffLine]] = {}
+    remaining = max_lines
+    for index, block in enumerate(blocks):
+        if block and remaining:
+            selected[index] = [block[0]]
+            remaining -= 1
+    for index in selected:
+        extra = blocks[index][1:1 + remaining]
+        selected[index].extend(extra)
+        remaining -= len(extra)
+    result = [
+        DiffLine(line.action, _visible_diff(line.text, max_chars),
+                 _visible_diff(line.replacement, max_chars)
+                 if line.action in {"replace", "before_after"} else "")
+        for block in selected.values() for line in block
+    ]
+    omitted = sum(len(block) for block in blocks) - len(result)
+    if omitted:
+        result.append(DiffLine("notice", f"另有 {omitted} 项差异未展示，详见差异链接"))
+    if not result:
+        result.append(DiffLine("notice", "未获得可展示的文本差异，请查看差异链接"))
     return result
 
 
@@ -162,7 +269,7 @@ def format_change_notification(
 ) -> str:
     scope_text = "、".join(
         display_category(item) if item.casefold().startswith("category:") else item
-        for item in scopes
+        for item in scopes if not item.startswith("单条目：")
     )
     delta = f"{change.size_delta:+d}"
     flags = ""
@@ -175,15 +282,31 @@ def format_change_notification(
     link = build_diff_url(api_url, change)
     if link_prefix:
         link = f"{link_prefix}{link}"
+    comment = change.comment
+    section = re.match(r"^\s*/\*\s*(.*?)\s*\*/\s*", comment, re.S)
+    title = change.title
+    if section:
+        title += f" § {section.group(1)[:100]}"
+        comment = comment[section.end():]
     lines = [
-        change.title,
-        f"§ {scope_text}",
+        title,
         f"{delta}{flags} | {change.user} | {_local_clock(change.timestamp)}",
-        link,
     ]
-    if change.comment:
-        lines.append(f"💬{change.comment}")
+    if scope_text:
+        lines.append(f"订阅：{scope_text[:200]}")
+    lines.append(link)
+    if comment:
+        lines.append(f"💬{_visible_diff(comment, 300)}")
     for item in diff_lines:
+        if item.action == "notice":
+            lines.append(f"…{item.text}")
+            continue
+        if item.action == "replace":
+            lines.append(f"✏把｢{item.text}｣改成｢{item.replacement}｣")
+            continue
+        if item.action == "before_after":
+            lines.append(f"✏修改前｢{item.text}｣\n  修改后｢{item.replacement}｣")
+            continue
         action = "添加" if item.action == "add" else "删除"
         lines.append(f"✏{action}｢{item.text}｣")
     return "\n".join(lines)
@@ -646,7 +769,7 @@ class WikiChangeMonitor:
                     )
                     break
                 result.matched += len(new_targets)
-                diff_lines: list[DiffLine] = []
+                diff_lines: list[DiffLine] = [DiffLine("notice", "差异预览已关闭")]
                 if new_targets and self.max_diff_lines:
                     try:
                         diff_html = await self.client.compare_revisions(
@@ -658,6 +781,7 @@ class WikiChangeMonitor:
                             max_chars=self.max_diff_line_chars,
                         )
                     except Exception:
+                        diff_lines = [DiffLine("notice", "差异预览获取失败，请查看差异链接")]
                         LOGGER.exception(
                             "Unable to fetch MediaWiki diff for revision %s", change.revid
                         )
