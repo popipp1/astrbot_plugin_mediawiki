@@ -2,6 +2,8 @@
 
 通过 MediaWiki Action API 查询页面摘要与链接。实现参考了 SILI-agent 的 MediaWiki 插件，但使用 AstrBot 当前的 Star 插件接口和异步 HTTP 客户端。
 
+当前版本：`1.3.1`。该版本修复 MediaWiki JSON v2 中 `bot: false`、`minor: false` 被错误显示为 `b`、`m` 的问题。
+
 ## 功能
 
 - 返回页面规范链接或较短的 `curid` 链接
@@ -134,7 +136,7 @@ https://zh.moegirl.org.cn/index.php?diff=8651943&oldid=8651800
 
 持久化状态位于 AstrBot 的 `data/plugin_data/astrbot_plugin_mediawiki/change_monitor.json`，插件更新不会覆盖。1.2.x 的状态文件会在读取时自动迁移到 v2，无需重新订阅。分类树很大时请降低递归深度、降低成员上限或提高分类刷新间隔。
 
-RecentChanges 可能出现时间戳略早、但稍后才可见的记录，因此 1.3.0 不再只读取严格晚于最后时间戳的更改，而是回退一小段时间并按 RCID 去重。重启后去重记录仍然有效。
+RecentChanges 可能出现时间戳略早、但稍后才可见的记录，因此 1.3 系列不再只读取严格晚于最后时间戳的更改，而是回退一小段时间并按 RCID 去重。重启后去重记录仍然有效。
 
 实现参考：
 

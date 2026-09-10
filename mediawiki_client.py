@@ -14,7 +14,7 @@ except ModuleNotFoundError:  # Allows pure helper tests before plugin deps are i
     aiohttp = None  # type: ignore[assignment]
 
 
-DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.3.0"
+DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.3.1"
 MAX_TITLES = 5
 
 
@@ -742,8 +742,8 @@ class MediaWikiClient:
                         comment=str(raw.get("comment", "")).strip(),
                         old_length=int(raw.get("oldlen", 0) or 0),
                         new_length=int(raw.get("newlen", 0) or 0),
-                        bot="bot" in raw,
-                        minor="minor" in raw,
+                        bot=bool(raw.get("bot", False)),
+                        minor=bool(raw.get("minor", False)),
                     )
                 )
                 if len(changes) >= limit:
