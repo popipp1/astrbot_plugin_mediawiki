@@ -33,7 +33,7 @@ except ImportError:  # Allows the helpers to be tested outside AstrBot.
 
 
 LOGGER = logging.getLogger(__name__)
-STATE_VERSION = 3
+STATE_VERSION = 4
 SUBSCRIPTION_CATEGORY = "category"
 SUBSCRIPTION_PAGE = "page"
 
@@ -79,6 +79,7 @@ class DiffLine:
     # Complete pre-cropping identity; never deduplicate rendered/truncated text.
     identity: tuple[str, ...] = ()
     show_position: bool = False
+    context: str = ""
 
 
 @dataclass(slots=True)
@@ -219,7 +220,13 @@ def _added_links(old: str, new: str) -> list[DiffLine] | None:
             if not label or ':' in target or not old.startswith(label, old_pos):
                 return None
             old_pos += len(label)
-            result.append(DiffLine('link_add', label, target if target != label else ''))
+            nearby = ''
+            if len(label) <= 2:
+                nearby = old[max(0, old_pos - len(label) - 6):old_pos + 6]
+                # Do not display half of an adjoining link as natural-language context.
+                nearby = re.sub(r'^.*\]\]', '', nearby)
+                nearby = re.sub(r'\[\[.*$', '', nearby)
+            result.append(DiffLine('link_add', label, target if target != label else '', context=nearby))
         new_pos = match.end()
     if not result or old[old_pos:] != new[new_pos:]:
         return None
@@ -239,11 +246,10 @@ def _compact_pair(line: DiffLine) -> list[DiffLine]:
                   .get_grouped_opcodes(12))
     if not groups:
         return [line]
-    return [DiffLine(
-        'before_after',
-        ('…' if group[0][1] else '') + left[group[0][1]:group[-1][2]]
+    return [replace(line, action='before_after',
+        text=('…' if group[0][1] else '') + left[group[0][1]:group[-1][2]]
         + ('…' if group[-1][2] < len(left) else ''),
-        ('…' if group[0][3] else '') + right[group[0][3]:group[-1][4]]
+        replacement=('…' if group[0][3] else '') + right[group[0][3]:group[-1][4]]
         + ('…' if group[-1][4] < len(right) else ''),
     ) for group in groups]
 
@@ -263,6 +269,16 @@ def _diff_block(cells: list[tuple[str, str, list[str], list[str]]], *, structure
         if (structured and after[2] and ''.join(after[3]) == before[1]
                 and all(re.fullmatch(r'<br\s*/?>', part, re.I) for part in after[2])):
             return [DiffLine('break_add', part) for part in after[2]]
+        # Exact pure insertion/deletion: removing every marked span must recover
+        # the entire opposite row. Never infer this from cropped previews.
+        for changed, other, action in ((after, before, 'local_add'), (before, after, 'local_delete')):
+            if (changed[2] and not other[2] and ''.join(changed[3]) == other[1]
+                    and all(part.strip() and not any(c in part for c in '[]{}<>|\n')
+                            for part in changed[2])):
+                return [DiffLine(action, part,
+                                context=re.sub(r"'{2,5}", '', changed[3][i])[-12:] + '▸'
+                                + re.sub(r"'{2,5}", '', changed[3][i + 1])[:12])
+                        for i, part in enumerate(changed[2])]
         # Only pair marked spans when every unchanged anchor agrees.
         if before[2] and len(before[2]) == len(after[2]) and before[3] == after[3]:
             result = []
@@ -313,6 +329,32 @@ def _visible_diff(text: str, max_chars: int) -> str:
         text = text.replace(" ", "␠").replace("\t", "⇥")
     text = text.replace("\r", "␍").replace("\n", "↵")
     return text if len(text) <= max_chars else text[:max_chars - 1] + "…"
+
+
+def _source_visible(text: str, limit: int) -> str:
+    """Prefer a complete link/template boundary when clipping source."""
+    if len(text) <= limit:
+        return _visible_diff(text, limit)
+    stack: list[str] = []
+    safe = 0
+    index = 0
+    while index < min(len(text), limit - 1):
+        opener = next((token for token in ('{{{', '{{', '[[') if text.startswith(token, index)), None)
+        if opener:
+            stack.append({'{{{': '}}}', '{{': '}}', '[[': ']]'}[opener])
+            index += len(opener)
+        elif stack and text.startswith(stack[-1], index):
+            index += len(stack.pop())
+        else:
+            index += 1
+        if not stack and index < limit:
+            safe = index
+    if stack:
+        if safe >= limit // 2:
+            return _visible_diff(text[:safe], limit - 1) + '…'
+        marker = '…〔源码截断〕'
+        return _visible_diff(text[:limit - len(marker)], limit) + marker
+    return _visible_diff(text, limit)
 
 
 def _category_changes(blocks, *, retain_rows=False):
@@ -482,6 +524,29 @@ def _event_blocks(rows: list[DiffRow], *, structured: bool) -> list[list[DiffLin
             index += 1
             continue
         positions = ((row.old_line, row.new_line),)
+        if structured and not inside_template and len(cells) == 1:
+            action, text, _, _ = cells[0]
+            heading = re.fullmatch(r'={2,6}\s*(.+?)\s*={2,6}', text)
+            if heading:
+                path = heading.group(1)
+                end = index + 1
+                while end < len(rows) and len(rows[end].cells) == 1 and rows[end].cells[0][0] == action:
+                    body = rows[end].cells[0][1]
+                    if not body.strip():
+                        end += 1
+                        continue
+                    year = re.fullmatch(r"'{2,3}(\d{4}年)'{2,3}", body.strip())
+                    if year and end == index + 1:
+                        path += ' / ' + year.group(1)
+                        end += 1
+                        continue
+                    if not body.startswith(('=', '|', '!', '{{', '}}')):
+                        blocks.append([DiffLine('section_' + action, body, path,
+                                                positions=positions, identity=(action, text, body, path))])
+                        index = end + 1
+                    break
+                if index > end:
+                    continue
         # Only coalesce contiguous one-sided source rows beginning with a real
         # table separator. Unchanged context and opposite-side edits are barriers.
         if structured and not inside_template and len(cells) == 1 and cells[0][1].strip() == '|-':
@@ -514,7 +579,7 @@ def _event_blocks(rows: list[DiffRow], *, structured: bool) -> list[list[DiffLin
                 continue
         events = []
         for event in _diff_block(cells, structured=structured):
-            identity = (event.action, event.text, event.replacement)
+            identity = (event.action, event.text, event.replacement, event.context)
             for fragment in _compact_pair(event):
                 # Cropped fragments keep their parent identity as well as their
                 # own text, so distinct long edits cannot collapse accidentally.
@@ -532,7 +597,7 @@ def _merge_repeated(blocks: list[list[DiffLine]]) -> list[list[DiffLine]]:
         result.append([])
         for event in block:
             # Notices and table rows must not lose their separate structural role.
-            if event.action not in {'add', 'delete', 'replace', 'link_add', 'break_add'}:
+            if event.action not in {'add', 'delete', 'replace', 'link_add', 'break_add', 'local_add', 'local_delete'}:
                 result[-1].append(event)
                 continue
             key = event.identity or (event.action, event.text, event.replacement)
@@ -583,6 +648,25 @@ def parse_diff_html(
             else:
                 rows.append(original)
     blocks = _merge_repeated(category_blocks + _event_blocks(rows, structured=structured and not protected))
+    has_content = any(line.text.strip() for block in blocks for line in block)
+    whitespace = False
+    if has_content:
+        filtered = []
+        for block in blocks:
+            kept = []
+            for line in block:
+                if line.action in {'add', 'delete'} and not line.text.strip():
+                    whitespace = True
+                else:
+                    kept.append(line)
+            if kept:
+                filtered.append(kept)
+        blocks = filtered
+    # Standalone headings/year labels remain visible if there is room, but must
+    # not displace substantive changes. Paired/structured events stay atomic.
+    blocks.sort(key=lambda block: int(all(line.action in {'add', 'delete'} and
+                re.fullmatch(r"\s*(?:={2,6}.+={2,6}|'{2,3}\d{4}年'{2,3})\s*", line.text)
+                for line in block)))
     # Reserve one preview for each row before spending the budget on details.
     selected: dict[int, list[DiffLine]] = {}
     remaining = max_lines
@@ -604,16 +688,19 @@ def parse_diff_html(
             if line.action in {"replace", "before_after"}:
                 pair_chars = min(max_chars, 60)
                 left, right = _focus_pair(left, right, pair_chars)
-                right = _visible_diff(right, pair_chars)
-                left = _visible_diff(left, pair_chars)
+                right = _source_visible(right, pair_chars)
+                left = _source_visible(left, pair_chars)
             else:
-                left = _visible_diff(left, min(max_chars, 60))
+                left = _source_visible(left, min(max_chars, 60))
                 if right:
-                    right = _visible_diff(right, min(max_chars, 60))
-            result.append(replace(line, text=left, replacement=right))
+                    right = _source_visible(right, min(max_chars, 60))
+            result.append(replace(line, text=left, replacement=right,
+                                  context=_visible_diff(line.context, 40) if line.context else ''))
     omitted = sum(len(block) for block in blocks) - len(result)
     if omitted:
         result.append(DiffLine("notice", f"另有 {omitted} 项差异未展示，详见差异链接"))
+    if whitespace:
+        result.append(DiffLine('notice', '另有空行调整'))
     if not result:
         result.append(DiffLine("notice", "未获得可展示的文本差异，请查看差异链接"))
     return result
@@ -624,6 +711,27 @@ def build_diff_url(api_url: str, change: RecentChange) -> str:
     if change.old_revid > 0:
         params["oldid"] = change.old_revid
     return get_index_url(api_url, params)
+
+
+def redirect_preview(change: RecentChange, targets: dict[int, str]) -> list[DiffLine]:
+    """Only summarize states verified from the exact revisions."""
+    if change.revid not in targets:
+        return []
+    new = targets[change.revid]
+    if change.change_type == 'new':
+        return [DiffLine('redirect', f'↪新建重定向 → ｢{_visible_diff(new, 120)}｣')] if new else []
+    if change.old_revid not in targets:
+        return []
+    old = targets[change.old_revid]
+    if new == old:
+        return []
+    if old and new:
+        text = f'↪重定向目标：｢{_visible_diff(old, 100)}｣ → ｢{_visible_diff(new, 100)}｣'
+    elif new:
+        text = f'↪改为重定向 → ｢{_visible_diff(new, 120)}｣'
+    else:
+        text = f'↩取消重定向（原目标：｢{_visible_diff(old, 120)}｣）'
+    return [DiffLine('redirect', text)]
 
 
 def _local_clock(timestamp: str) -> str:
@@ -652,7 +760,15 @@ def format_change_notification(
     delta = f"{change.size_delta:+d}"
     flags = ""
     is_new_page = change.change_type == "new"
-    if is_new_page:
+    is_move = change.change_type == 'move'
+    if is_move:
+        delta = '移动'
+    if is_move:
+        link = get_index_url(api_url, {'title': 'Special:Log', 'logid': change.logid}) if change.logid else get_index_url(api_url, {'title': change.move_target})
+        detail = ('保留旧标题重定向' if change.suppress_redirect is False else
+                  '未保留旧标题重定向' if change.suppress_redirect is True else '重定向保留状态未知')
+        diff_lines = [DiffLine('move', f'📦移动至｢{_visible_diff(change.move_target, 140)}｣\n{detail}')]
+    elif is_new_page:
         flags += " N"
     if change.minor:
         flags += " m"
@@ -662,8 +778,8 @@ def format_change_notification(
         params = {"curid": change.pageid} if change.pageid > 0 else {"title": change.title}
         link = get_index_url(api_url, params)
         # New pages link to the article itself, never to a comparison or preview.
-        diff_lines = []
-    else:
+        diff_lines = [line for line in diff_lines if line.action == 'redirect']
+    elif not is_move:
         link = build_diff_url(api_url, change)
     if link_prefix:
         link = f"{link_prefix}{link}"
@@ -683,8 +799,22 @@ def format_change_notification(
     if comment:
         lines.append(f"💬{_visible_diff(comment, 100)}")
     header_count = len(lines)
+    last_position = None
     for item in diff_lines:
+        if item.action != 'replace':
+            last_position = None
         count = f"（{item.count}处）" if item.count > 1 else ""
+        if item.action in {'move', 'redirect'}:
+            lines.append(item.text)
+            continue
+        if item.action in {'local_add', 'local_delete'}:
+            action = '添加' if item.action == 'local_add' else '删除'
+            lines.append(f'✏{action}｢{item.text}｣（附近：{item.context}）{count}')
+            continue
+        if item.action in {'section_add', 'section_delete'}:
+            action = '添加' if item.action == 'section_add' else '删除'
+            lines.append(f'✏在｢{item.replacement}｣下{action}｢{item.text}｣')
+            continue
         if item.action == 'break_add':
             lines.append(f"✏添加换行标签{count}")
             continue
@@ -697,7 +827,8 @@ def format_change_notification(
             continue
         if item.action == "link_add":
             target = f"（目标：{item.replacement}）" if item.replacement else ""
-            lines.append(f"✏为｢{item.text}｣添加内链{target}{count}")
+            nearby = f'（附近：{item.context}）' if item.context else ''
+            lines.append(f"✏为｢{item.text}｣添加内链{target}{nearby}{count}")
             continue
         if item.action == "notice":
             lines.append(f"…{item.text}")
@@ -710,6 +841,12 @@ def format_change_notification(
                     position = f'第{new_line}行：'
                 elif old_line is not None:
                     position = f'原第{old_line}行：'
+            if position and position == last_position:
+                position = '同一行：'
+            elif position:
+                last_position = position
+            else:
+                last_position = None
             lines.append(f"✏{position}把｢{item.text}｣改成｢{item.replacement}｣{count}")
             continue
         if item.action == "before_after":
@@ -723,7 +860,8 @@ def format_change_notification(
             lines = [value for value in lines if value != f"💬{_visible_diff(comment, 100)}"]
             message = '\n'.join(lines)
         return message
-    footer = ("…已达到消息长度上限，其余内容请查看条目链接" if is_new_page
+    footer = ("…已达到消息长度上限，其余内容请查看日志链接" if is_move else
+              "…已达到消息长度上限，其余内容请查看条目链接" if is_new_page
               else "…已达到消息长度上限，其余内容请查看差异链接")
     header = lines[:header_count]
     # Preserve the URL and metadata; summaries and subscription labels are optional.
@@ -788,6 +926,7 @@ class MonitorState:
     recent_rcids: list[int] = field(default_factory=list)
     subscriptions: list[ChangeSubscription] = field(default_factory=list)
     pending: list[PendingNotification] = field(default_factory=list)
+    move_redirects: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -884,6 +1023,8 @@ class JsonStateStore:
                 ],
                 subscriptions=subscriptions,
                 pending=pending,
+                move_redirects=[item for item in raw.get('move_redirects', [])
+                                if isinstance(item, dict) and isinstance(item.get('umos'), list)],
             )
         except (AttributeError, OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             LOGGER.warning("Unable to read MediaWiki change state %s: %s", self.path, exc)
@@ -900,6 +1041,7 @@ class JsonStateStore:
             "recent_rcids": state.recent_rcids,
             "subscriptions": [asdict(item) for item in state.subscriptions],
             "pending": [asdict(item) for item in state.pending],
+            "move_redirects": state.move_redirects,
         }
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(
@@ -925,6 +1067,8 @@ class WikiChangeMonitor:
         max_message_chars: int = 700,
         max_pending: int = 500,
         include_bot_edits: bool = True,
+        include_moves: bool = True,
+        detect_redirects: bool = True,
         overlap_seconds: int = 60,
         recent_rcid_limit: int = 20_000,
         category_refresh_interval_seconds: int = 900,
@@ -943,6 +1087,8 @@ class WikiChangeMonitor:
         self.max_message_chars = max(500, min(int(max_message_chars), 5000))
         self.max_pending = max(1, min(int(max_pending), 10_000))
         self.include_bot_edits = include_bot_edits
+        self.include_moves = include_moves
+        self.detect_redirects = detect_redirects
         self.overlap_seconds = max(0, min(int(overlap_seconds), 600))
         self.recent_rcid_limit = max(1000, min(int(recent_rcid_limit), 100_000))
         self.category_refresh_interval_seconds = max(
@@ -1204,15 +1350,26 @@ class WikiChangeMonitor:
                 limit=self.max_changes_per_poll,
                 include_bot_edits=self.include_bot_edits,
                 exclude_rcids=seen,
+                include_moves=self.include_moves,
             )
-            changes = [item for item in changes if item.rcid not in seen]
+            changes = [item for item in changes if item.rcid not in seen
+                       and (self.include_moves or item.change_type != 'move')]
+            # A move's revid belongs to the moved page, NOT the new redirect.
+            # Only reorder simultaneous source-title creations by the same user.
+            for move in [item for item in changes if item.change_type == 'move']:
+                first = next((i for i, item in enumerate(changes)
+                              if item.change_type == 'new' and item.title == move.title
+                              and item.timestamp == move.timestamp and item.user == move.user), None)
+                if first is not None and changes.index(move) > first:
+                    changes.remove(move)
+                    changes.insert(first, move)
             await self._learn_new_category_memberships(changes)
             result.fetched = len(changes)
             pending_keys = {item.key for item in self.state.pending}
             models: dict[int, str] = {}
             model_ids = list(dict.fromkeys(
                 revid for change in changes
-                if self.max_diff_lines and change.change_type != 'new'
+                if self.max_diff_lines and change.change_type == 'edit'
                 and any((umo, change.rcid) not in pending_keys
                         for umo in self._matching_targets(change, previous_members, update_titles=False))
                 for revid in (change.old_revid, change.revid) if revid > 0
@@ -1222,6 +1379,18 @@ class WikiChangeMonitor:
                     models = await self.client.revision_content_models(model_ids)
                 except Exception:
                     LOGGER.warning("Revision content models unavailable; using literal diff previews", exc_info=True)
+            redirect_targets: dict[int, str] = {}
+            if self.detect_redirects:
+                redirect_ids = list(dict.fromkeys(
+                    revid for change in changes if change.change_type in {'edit', 'new'}
+                    and any((umo, change.rcid) not in pending_keys
+                            for umo in self._matching_targets(change, previous_members, update_titles=False))
+                    for revid in (change.old_revid, change.revid) if revid > 0))
+                if redirect_ids:
+                    try:
+                        redirect_targets = await self.client.revision_redirects(redirect_ids)
+                    except Exception:
+                        LOGGER.warning('Historical redirect states unavailable; retaining ordinary notifications')
             consumed: list[RecentChange] = []
             deferred_timestamps: list[str] = []
 
@@ -1236,6 +1405,16 @@ class WikiChangeMonitor:
                     for umo, scopes in targets.items()
                     if (umo, change.rcid) not in pending_keys
                 ]
+                if change.change_type == 'new' and redirect_targets.get(change.revid):
+                    covered = {umo for move in self.state.move_redirects
+                               if move.get('title') == change.title
+                               and move.get('timestamp') == change.timestamp and move.get('user') == change.user
+                               and bool(change.timestamp and change.user)
+                               and change.pageid > 0 and move.get('pageid', 0) > 0
+                               and change.pageid != move['pageid']
+                               and move.get('target') == redirect_targets[change.revid]
+                               for umo in move['umos']}
+                    new_targets = [(umo, scopes) for umo, scopes in new_targets if umo not in covered]
                 if len(self.state.pending) + len(new_targets) > self.max_pending:
                     LOGGER.warning(
                         "MediaWiki pending queue is full (%s); cursor retained for retry",
@@ -1244,7 +1423,7 @@ class WikiChangeMonitor:
                     break
                 result.matched += len(new_targets)
                 diff_lines: list[DiffLine] = []
-                if new_targets and self.max_diff_lines and change.change_type != "new":
+                if new_targets and self.max_diff_lines and change.change_type == 'edit':
                     try:
                         diff_html = await self.client.compare_revisions(
                             change.old_revid, change.revid
@@ -1262,6 +1441,8 @@ class WikiChangeMonitor:
                         LOGGER.exception(
                             "Unable to fetch MediaWiki diff for revision %s", change.revid
                         )
+                if new_targets and self.detect_redirects and change.change_type in {'new', 'edit'}:
+                    diff_lines = redirect_preview(change, redirect_targets) + diff_lines
                 for umo, scopes in new_targets:
                     message = format_change_notification(
                         change,
@@ -1275,6 +1456,11 @@ class WikiChangeMonitor:
                     self.state.pending.append(pending)
                     pending_keys.add(pending.key)
                     result.queued += 1
+                if change.change_type == 'move' and change.suppress_redirect is False and new_targets:
+                    self.state.move_redirects.append(dict(pageid=change.pageid, title=change.title,
+                                                          target=change.move_target, timestamp=change.timestamp,
+                                                          user=change.user, umos=[umo for umo, _ in new_targets]))
+                    self.state.move_redirects = self.state.move_redirects[-self.recent_rcid_limit:]
                 consumed.append(change)
 
             if consumed or deferred_timestamps:
@@ -1437,9 +1623,10 @@ class WikiChangeMonitor:
                     change.pageid > 0
                     and subscription.page_id > 0
                     and change.pageid == subscription.page_id
-                ) or change.title.casefold() == subscription.target.casefold()
-                if update_titles and matches and change.pageid == subscription.page_id and change.title:
-                    subscription.target = change.title
+                ) or ((change.pageid <= 0 or subscription.page_id <= 0)
+                      and subscription.target.casefold() in {change.title.casefold(), change.move_target.casefold()})
+                if update_titles and matches and (change.pageid == subscription.page_id or change.change_type == 'move') and change.title:
+                    subscription.target = change.move_target if change.change_type == 'move' else change.title
             else:
                 previous_ids, previous_titles = previous_members.get(
                     subscription.key, (set(), set())
@@ -1449,7 +1636,7 @@ class WikiChangeMonitor:
                 matches = (
                     change.pageid > 0
                     and change.pageid in (previous_ids | current_ids)
-                ) or change.title.casefold() in (previous_titles | current_titles)
+                ) or bool({change.title.casefold(), change.move_target.casefold()} & (previous_titles | current_titles))
             if not matches or (
                 subscription.start_timestamp
                 and change.timestamp < subscription.start_timestamp

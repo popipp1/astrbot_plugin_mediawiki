@@ -14,7 +14,7 @@ except ModuleNotFoundError:  # Allows pure helper tests before plugin deps are i
     aiohttp = None  # type: ignore[assignment]
 
 
-DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.6.0"
+DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.7.0"
 MAX_TITLES = 5
 
 
@@ -116,6 +116,9 @@ class RecentChange:
     new_length: int
     bot: bool = False
     minor: bool = False
+    logid: int = 0
+    move_target: str = ""
+    suppress_redirect: bool | None = None
 
     @property
     def size_delta(self) -> int:
@@ -128,6 +131,25 @@ def normalize_title(raw: str) -> str:
     if not title:
         return ""
     return title[0].upper() + title[1:]
+
+
+def parse_redirect_target(content: str, aliases: list[str]) -> str | None:
+    """Conservative source-level redirect parsing, without template expansion."""
+    text = content.lstrip('\ufeff \t\r\n')
+    # A protected prefix or unexpanded template is not enough evidence to infer
+    # an effective redirect state from source alone.
+    if text.startswith('<!--'):
+        return None
+    directive = '|'.join(re.escape(alias) for alias in aliases if alias)
+    if not directive:
+        return None
+    match = re.match(r'(?:' + directive + r')(?=\s|:|\[|$)\s*:?\s*\[\[([^\[\]{}<>\n]+)\]\]', text, re.I)
+    if match:
+        target = match.group(1).split('|', 1)[0].strip().replace('_', ' ')
+        return target if target else None
+    if re.match(r'(?:' + directive + r')(?=\s|:|\[|$)', text, re.I):
+        return None
+    return ''
 
 
 def split_title(raw: str) -> TitleRequest:
@@ -210,6 +232,7 @@ class MediaWikiClient:
         self._extracts_supported = True
         self._authenticated = False
         self._login_lock = asyncio.Lock()
+        self._redirect_aliases: list[str] | None = None
 
     @property
     def authentication_configured(self) -> bool:
@@ -737,6 +760,7 @@ class MediaWikiClient:
         limit: int = 1000,
         include_bot_edits: bool = True,
         exclude_rcids: set[int] | None = None,
+        include_moves: bool = True,
     ) -> list[RecentChange]:
         """Fetch unseen edit/new entries from oldest to newest since a timestamp."""
         limit = max(1, min(int(limit), 10_000))
@@ -750,8 +774,8 @@ class MediaWikiClient:
                     "list": "recentchanges",
                     "rcstart": since,
                     "rcdir": "newer",
-                    "rctype": "edit|new",
-                    "rcprop": "title|ids|sizes|flags|user|timestamp|comment|tags",
+                    "rctype": "edit|new|log" if include_moves else "edit|new",
+                    "rcprop": "title|ids|sizes|flags|user|timestamp|comment|tags|loginfo",
                     "rclimit": "max",
                 }
             )
@@ -767,12 +791,21 @@ class MediaWikiClient:
             for raw in _as_list(raw_changes):
                 rcid = int(raw.get("rcid", 0) or 0)
                 revid = int(raw.get("revid", 0) or 0)
-                if rcid <= 0 or revid <= 0 or rcid in excluded:
+                is_move = (raw.get('type') == 'log' and raw.get('logtype') == 'move'
+                           and raw.get('logaction') in {'move', 'move_redir'})
+                if raw.get('type') == 'log' and not is_move:
                     continue
+                logparams = raw.get('logparams', {})
+                logparams = logparams if isinstance(logparams, dict) else {}
+                target = str(logparams.get('target_title', '')).strip() if is_move else ''
+                if rcid <= 0 or (revid <= 0 and not is_move) or rcid in excluded:
+                    continue
+                if is_move and (not target or not raw.get('title') or not include_moves):
+                    continue  # Hidden/incomplete logs must not reveal guessed titles.
                 changes.append(
                     RecentChange(
                         rcid=rcid,
-                        change_type=str(raw.get("type", "edit")),
+                        change_type='move' if is_move else str(raw.get("type", "edit")),
                         namespace=int(raw.get("ns", 0) or 0),
                         title=str(raw.get("title", "")).strip(),
                         pageid=int(raw.get("pageid", 0) or 0),
@@ -785,6 +818,10 @@ class MediaWikiClient:
                         new_length=int(raw.get("newlen", 0) or 0),
                         bot=bool(raw.get("bot", False)),
                         minor=bool(raw.get("minor", False)),
+                        logid=int(raw.get('logid', 0) or 0),
+                        move_target=target,
+                        suppress_redirect=(bool(logparams['suppressredirect'])
+                                           if 'suppressredirect' in logparams else None),
                     )
                 )
                 if len(changes) >= limit:
@@ -799,6 +836,44 @@ class MediaWikiClient:
             if not continuation or len(changes) >= limit:
                 break
         return changes
+
+    async def revision_redirects(self, revids: list[int]) -> dict[int, str]:
+        """Exact historical main-slot redirect targets; missing means unknown.
+
+        An empty value means confirmed non-redirect. No current-page redirect
+        flags or latest content are used to explain an old revision.
+        """
+        ids = list(dict.fromkeys(revid for revid in revids if revid > 0))
+        if not ids:
+            return {}
+        if self._redirect_aliases is None:
+            params = self._base_query_params()
+            params.update(meta='siteinfo', siprop='magicwords')
+            data = await self._request(params)
+            self._redirect_aliases = next(
+                (item.get('aliases', []) for item in data.get('query', {}).get('magicwords', [])
+                 if item.get('name') == 'redirect'), [])
+            if not self._redirect_aliases:
+                self._redirect_aliases = None
+                raise MediaWikiAPIError('redirect-aliases-unavailable', '无法确认重定向指令')
+        result = {}
+        for offset in range(0, len(ids), 20):
+            params = self._base_query_params()
+            params.update(prop='revisions', revids='|'.join(map(str, ids[offset:offset + 20])),
+                          rvprop='ids|contentmodel|content', rvslots='main')
+            data = await self._request(params)
+            for page in _as_list(data.get('query', {}).get('pages')):
+                for revision in _as_list(page.get('revisions')):
+                    slot = revision.get('slots', {}).get('main', revision)
+                    if slot.get('contentmodel', revision.get('contentmodel')) != 'wikitext':
+                        continue
+                    content = slot.get('content', slot.get('*'))
+                    if not isinstance(content, str):
+                        continue
+                    target = parse_redirect_target(content, self._redirect_aliases)
+                    if target is not None:
+                        result[int(revision.get('revid', 0))] = target
+        return result
 
     async def compare_revisions(self, old_revid: int, revid: int) -> str:
         """Return the HTML table rows generated by action=compare."""
