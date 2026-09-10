@@ -33,7 +33,7 @@ except ImportError:  # Allows the helpers to be tested outside AstrBot.
 
 
 LOGGER = logging.getLogger(__name__)
-STATE_VERSION = 2
+STATE_VERSION = 3
 SUBSCRIPTION_CATEGORY = "category"
 SUBSCRIPTION_PAGE = "page"
 
@@ -435,6 +435,8 @@ class ChangeSubscription:
     page_id: int = 0
     member_page_ids: list[int] = field(default_factory=list)
     member_titles: list[str] = field(default_factory=list)
+    member_categories: list[str] = field(default_factory=list)
+    member_category_depths: dict[str, int] = field(default_factory=dict)
     truncated: bool = False
 
     @property
@@ -527,6 +529,15 @@ class JsonStateStore:
                         member_titles=[
                             str(value) for value in item.get("member_titles", [])
                         ],
+                        member_categories=[
+                            str(value) for value in item.get("member_categories", [])
+                        ],
+                        member_category_depths={
+                            str(key): int(value)
+                            for key, value in item.get(
+                                "member_category_depths", {}
+                            ).items()
+                        },
                         truncated=bool(item.get("truncated", False)),
                     )
                 )
@@ -597,6 +608,7 @@ class WikiChangeMonitor:
         overlap_seconds: int = 60,
         recent_rcid_limit: int = 20_000,
         category_refresh_interval_seconds: int = 900,
+        new_page_grace_seconds: int = 900,
         link_prefix_for_umo: Callable[[str], str] | None = None,
     ) -> None:
         self.client = client
@@ -615,6 +627,9 @@ class WikiChangeMonitor:
         self.recent_rcid_limit = max(1000, min(int(recent_rcid_limit), 100_000))
         self.category_refresh_interval_seconds = max(
             60, min(int(category_refresh_interval_seconds), 86_400)
+        )
+        self.new_page_grace_seconds = max(
+            0, min(int(new_page_grace_seconds), 3600)
         )
         self.link_prefix_for_umo = link_prefix_for_umo or (lambda _umo: "")
         self.state = MonitorState()
@@ -701,6 +716,8 @@ class WikiChangeMonitor:
             if existing:
                 existing.member_page_ids = sorted(snapshot.page_ids)
                 existing.member_titles = sorted(snapshot.titles)
+                existing.member_categories = sorted(snapshot.categories)
+                existing.member_category_depths = dict(snapshot.category_depths)
                 existing.truncated = snapshot.truncated
                 await self.store.save(self.state)
                 self._category_refresh_at[category.casefold()] = time.monotonic()
@@ -712,6 +729,8 @@ class WikiChangeMonitor:
                 start_timestamp=now,
                 member_page_ids=sorted(snapshot.page_ids),
                 member_titles=sorted(snapshot.titles),
+                member_categories=sorted(snapshot.categories),
+                member_category_depths=dict(snapshot.category_depths),
                 truncated=snapshot.truncated,
             )
             self.state.subscriptions.append(subscription)
@@ -867,12 +886,18 @@ class WikiChangeMonitor:
                 exclude_rcids=seen,
             )
             changes = [item for item in changes if item.rcid not in seen]
+            await self._learn_new_category_memberships(changes)
             result.fetched = len(changes)
             pending_keys = {item.key for item in self.state.pending}
             consumed: list[RecentChange] = []
+            deferred_timestamps: list[str] = []
 
             for change in changes:
                 targets = self._matching_targets(change, previous_members)
+                if not targets and self._should_defer_new_page(change):
+                    if change.timestamp:
+                        deferred_timestamps.append(change.timestamp)
+                    continue
                 new_targets = [
                     (umo, scopes)
                     for umo, scopes in targets.items()
@@ -917,12 +942,12 @@ class WikiChangeMonitor:
                     result.queued += 1
                 consumed.append(change)
 
-            if consumed:
+            if consumed or deferred_timestamps:
                 timestamps = [item.timestamp for item in consumed if item.timestamp]
-                if timestamps:
-                    self.state.last_timestamp = max(
-                        [self.state.last_timestamp, *timestamps]
-                    )
+                next_timestamp = max([self.state.last_timestamp, *timestamps])
+                if deferred_timestamps:
+                    next_timestamp = min(next_timestamp, min(deferred_timestamps))
+                self.state.last_timestamp = next_timestamp
                 deduplicated = list(
                     dict.fromkeys(
                         [*self.state.recent_rcids, *(item.rcid for item in consumed)]
@@ -935,6 +960,98 @@ class WikiChangeMonitor:
             result.sent += sent
             result.failed += failed
             return result
+
+    def _should_defer_new_page(self, change: RecentChange) -> bool:
+        if change.change_type != "new" or not self.new_page_grace_seconds:
+            return False
+        eligible = any(
+            item.kind == SUBSCRIPTION_CATEGORY
+            and (
+                not item.start_timestamp
+                or not change.timestamp
+                or change.timestamp >= item.start_timestamp
+            )
+            for item in self.state.subscriptions
+        )
+        if not eligible or not change.timestamp:
+            return False
+        try:
+            moment = datetime.fromisoformat(change.timestamp.replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - moment.astimezone(timezone.utc)).total_seconds()
+            return age < self.new_page_grace_seconds
+        except ValueError:
+            return False
+
+    async def _learn_new_category_memberships(
+        self, changes: list[RecentChange]
+    ) -> None:
+        subscriptions = [
+            item
+            for item in self.state.subscriptions
+            if item.kind == SUBSCRIPTION_CATEGORY
+        ]
+        new_changes = [
+            item for item in changes if item.change_type == "new" and item.pageid > 0
+        ]
+        if not subscriptions or not new_changes:
+            return
+
+        categories_by_page = await self.client.page_categories(
+            {item.pageid for item in new_changes}
+        )
+        for subscription in subscriptions:
+            watched_depths = {
+                str(key).casefold(): int(value)
+                for key, value in subscription.member_category_depths.items()
+            }
+            for item in subscription.member_categories:
+                watched_depths.setdefault(item.casefold(), self.category_depth)
+            watched_depths[subscription.target.casefold()] = 0
+
+            # Discover a newly-created subcategory before checking new pages
+            # from the same RecentChanges batch, regardless of event ordering.
+            changed = True
+            while changed:
+                changed = False
+                for change in new_changes:
+                    if change.namespace != 14 or not change.title:
+                        continue
+                    direct = {
+                        value.casefold()
+                        for value in categories_by_page.get(change.pageid, set())
+                    }
+                    parents = direct & set(watched_depths)
+                    if not parents:
+                        continue
+                    category_key = change.title.casefold()
+                    depth = min(watched_depths[parent] + 1 for parent in parents)
+                    if depth <= self.category_depth and (
+                        category_key not in watched_depths
+                        or depth < watched_depths[category_key]
+                    ):
+                        watched_depths[category_key] = depth
+                        changed = True
+
+            for change in new_changes:
+                direct = {
+                    value.casefold()
+                    for value in categories_by_page.get(change.pageid, set())
+                }
+                if not direct & set(watched_depths):
+                    continue
+                if change.pageid not in subscription.member_page_ids:
+                    subscription.member_page_ids.append(change.pageid)
+                    subscription.member_page_ids.sort()
+                    if len(subscription.member_page_ids) > self.max_members:
+                        subscription.truncated = True
+                title_key = change.title.casefold()
+                if title_key and title_key not in subscription.member_titles:
+                    subscription.member_titles.append(title_key)
+                    subscription.member_titles.sort()
+            subscription.member_categories = sorted(watched_depths)
+            subscription.member_category_depths = dict(sorted(watched_depths.items()))
 
     async def _refresh_memberships(self) -> None:
         grouped: dict[str, list[ChangeSubscription]] = {}
@@ -958,6 +1075,10 @@ class WikiChangeMonitor:
                 for subscription in subscriptions:
                     subscription.member_page_ids = sorted(snapshot.page_ids)
                     subscription.member_titles = sorted(snapshot.titles)
+                    subscription.member_categories = sorted(snapshot.categories)
+                    subscription.member_category_depths = dict(
+                        snapshot.category_depths
+                    )
                     subscription.truncated = snapshot.truncated
                 self._category_refresh_at[key] = now
             except Exception:

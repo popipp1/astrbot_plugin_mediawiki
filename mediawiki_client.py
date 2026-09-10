@@ -14,7 +14,7 @@ except ModuleNotFoundError:  # Allows pure helper tests before plugin deps are i
     aiohttp = None  # type: ignore[assignment]
 
 
-DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.4.2"
+DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.4.3"
 MAX_TITLES = 5
 
 
@@ -96,6 +96,7 @@ class CategorySnapshot:
     page_ids: set[int] = field(default_factory=set)
     titles: set[str] = field(default_factory=set)
     categories: list[str] = field(default_factory=list)
+    category_depths: dict[str, int] = field(default_factory=dict)
     truncated: bool = False
 
 
@@ -633,6 +634,7 @@ class MediaWikiClient:
                 continue
             visited.add(key)
             snapshot.categories.append(category)
+            snapshot.category_depths[category.casefold()] = depth
             continuation = ""
 
             while len(snapshot.page_ids) < max_members:
@@ -688,6 +690,45 @@ class MediaWikiClient:
         if queue:
             snapshot.truncated = True
         return snapshot
+
+    async def page_categories(
+        self, page_ids: list[int] | set[int]
+    ) -> dict[int, set[str]]:
+        """Return direct category memberships for local page IDs."""
+        unique_ids = list(dict.fromkeys(int(value) for value in page_ids if int(value) > 0))
+        result: dict[int, set[str]] = {page_id: set() for page_id in unique_ids}
+        for offset in range(0, len(unique_ids), 50):
+            batch = unique_ids[offset : offset + 50]
+            continuation: dict[str, Any] = {}
+            while True:
+                params = self._base_query_params()
+                params.update(
+                    {
+                        "prop": "categories",
+                        "pageids": "|".join(str(value) for value in batch),
+                        "cllimit": "max",
+                    }
+                )
+                params.update(continuation)
+                data = await self._request(params)
+                query = data.get("query", {})
+                raw_pages = query.get("pages", []) if isinstance(query, dict) else []
+                for raw_page in _as_list(raw_pages):
+                    page_id = int(raw_page.get("pageid", 0) or 0)
+                    if page_id not in result:
+                        continue
+                    for raw_category in _as_list(raw_page.get("categories")):
+                        title = str(raw_category.get("title", "")).strip()
+                        if title:
+                            result[page_id].add(title)
+
+                raw_continue = data.get("continue", {})
+                if not isinstance(raw_continue, dict) or "clcontinue" not in raw_continue:
+                    break
+                continuation = {
+                    str(key): value for key, value in raw_continue.items()
+                }
+        return result
 
     async def recent_changes(
         self,

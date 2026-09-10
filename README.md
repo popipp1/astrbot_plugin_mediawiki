@@ -2,7 +2,11 @@
 
 通过 MediaWiki Action API 查询页面摘要与链接。实现参考了 SILI-agent 的 MediaWiki 插件，但使用 AstrBot 当前的 Star 插件接口和异步 HTTP 客户端。
 
-当前版本：`1.4.2`。长段落中的纯内链添加可汇总为 `✏为｢RAISE A SUILEN｣添加内链`；分散的文本修改拆成局部片段，预览每侧最多 60 字符。存在其他正文变化时不会仅汇总链接而隐藏修改。分类、文件等带名字空间的语法及包含 HTML 标签的内容不使用此简写。
+当前版本：`1.4.3`。分类监控会即时查询新页面的直接分类，不必等待完整分类树的下一次刷新；已知子分类中的新页面同样可以命中。新分类和新页面出现在同一批最近更改时，会按配置的递归深度建立关联。
+
+考虑到分类索引可能稍晚于 RecentChanges，新页面首次未命中时默认在 900 秒内重新检查，并暂时保留时间水位；其他编辑仍通过 RCID 去重继续处理。超过窗口仍不属于监控分类的页面会正常略过。可通过 `change_new_page_grace_seconds` 调整为 0–3600 秒。
+
+1.4.2 加入的紧凑差异仍然保留：长段落中的纯内链添加可汇总为 `✏为｢RAISE A SUILEN｣添加内链`；分散的文本修改拆成局部片段，预览每侧最多 60 字符。存在其他正文变化时不会仅汇总链接而隐藏修改。分类、文件等带名字空间的语法及包含 HTML 标签的内容不使用此简写。
 
 可在插件配置中设置 `change_message_max_chars=700`、`change_diff_line_chars=60`、`change_diff_lines=3`，得到更紧凑的消息。整条上限包含标题、摘要、订阅、链接、差异和省略提示，范围 500–5000；差异项目完整保留或省略，不会拆开修改前后。单行字符限制分别作用于修改前后两侧，紧凑预览取配置与 60 的较小值。长度按 Python 字符数计算，不是 UTF-8 字节数。
 
@@ -145,13 +149,14 @@ https://zh.moegirl.org.cn/index.php?diff=8651943&oldid=8651800
 - `change_poll_interval_seconds`：轮询间隔，最小 30 秒，默认 120 秒。
 - `change_category_depth`：子分类递归深度，默认 2。
 - `change_category_refresh_interval_seconds`：分类树刷新间隔，默认 900 秒；相同分类共享一次刷新。
+- `change_new_page_grace_seconds`：新页面分类识别重试窗口，默认 900 秒；设为 0 可关闭重试。
 - `change_max_members`：每项监控最多保存的分类成员数，默认 5000。
 - `change_overlap_seconds`：每轮从水位前方回退的秒数，默认 60 秒。
 - `change_recent_rcid_limit`：持久化的已处理 RCID 数量，默认 20000。
 - `change_diff_lines`：每条通知最多显示的差异项目，默认 5；设为 0 可关闭 compare 请求。
 - `change_include_bot_edits`：是否包含机器人编辑。
 
-持久化状态位于 AstrBot 的 `data/plugin_data/astrbot_plugin_mediawiki/change_monitor.json`，插件更新不会覆盖。1.2.x 的状态文件会在读取时自动迁移到 v2，无需重新订阅。分类树很大时请降低递归深度、降低成员上限或提高分类刷新间隔。
+持久化状态位于 AstrBot 的 `data/plugin_data/astrbot_plugin_mediawiki/change_monitor.json`，插件更新不会覆盖。旧版状态文件会在读取时自动迁移到 v3，无需重新订阅。分类树很大时请降低递归深度、降低成员上限或提高分类刷新间隔。
 
 RecentChanges 可能出现时间戳略早、但稍后才可见的记录，因此 1.3 系列不再只读取严格晚于最后时间戳的更改，而是回退一小段时间并按 RCID 去重。重启后去重记录仍然有效。
 

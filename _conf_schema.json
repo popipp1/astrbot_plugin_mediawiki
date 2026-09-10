@@ -24,7 +24,7 @@
     "description": "HTTP User-Agent",
     "type": "string",
     "hint": "部分 Wiki 要求使用可识别的 User-Agent；建议包含机器人名称和联系方式。",
-    "default": "AstrBot-MediaWiki/1.4.2"
+    "default": "AstrBot-MediaWiki/1.4.3"
   },
   "timeout_seconds": {
     "description": "请求超时秒数",
@@ -82,6 +82,12 @@
     "description": "分类树刷新间隔（秒）",
     "type": "int",
     "hint": "分类成员树独立低频刷新；相同分类只请求一次。最小 60 秒，默认 900 秒。",
+    "default": 900
+  },
+  "change_new_page_grace_seconds": {
+    "description": "新页面分类识别重试窗口（秒）",
+    "type": "int",
+    "hint": "新页面暂未出现在目标分类时，在该窗口内继续重查，避免分类索引延迟造成漏报；0 表示关闭，最大 3600 秒。",
     "default": 900
   },
   "change_max_members": {
