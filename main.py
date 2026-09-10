@@ -17,7 +17,12 @@ except ImportError:  # Compatibility with AstrBot releases before this helper.
     def get_astrbot_plugin_data_path() -> str:
         return str(Path(get_astrbot_data_path()) / "plugin_data")
 
-from .change_monitor import WikiChangeMonitor, display_category
+from .change_monitor import (
+    SUBSCRIPTION_CATEGORY,
+    SUBSCRIPTION_PAGE,
+    WikiChangeMonitor,
+    display_category,
+)
 
 from .mediawiki_client import (
     InterwikiPage,
@@ -35,8 +40,8 @@ from .mediawiki_client import (
 @register(
     "astrbot_plugin_mediawiki",
     "Lukec",
-    "MediaWiki 页面查询与分类变更推送",
-    "1.2.1",
+    "MediaWiki 页面查询与条目/分类变更推送",
+    "1.3.0",
 )
 class MediaWikiPlugin(Star):
     """Query page summaries and links through the MediaWiki Action API."""
@@ -45,6 +50,8 @@ class MediaWikiPlugin(Star):
     SEARCH_COMMAND_NAMES = ("wiki搜索", "wikisearch")
     WATCH_COMMAND_NAMES = ("wiki监控", "wikiwatch")
     UNWATCH_COMMAND_NAMES = ("wiki取消监控", "wikiunwatch")
+    WATCH_PAGE_COMMAND_NAMES = ("wiki监控条目", "wikiwatchpage")
+    UNWATCH_PAGE_COMMAND_NAMES = ("wiki取消监控条目", "wikiunwatchpage")
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -57,7 +64,7 @@ class MediaWikiPlugin(Star):
 
         self.client = MediaWikiClient(
             str(config.get("api_url", "https://zh.wikipedia.org/w/api.php")),
-            user_agent=str(config.get("user_agent", "AstrBot-MediaWiki/1.2.1")),
+            user_agent=str(config.get("user_agent", "AstrBot-MediaWiki/1.3.0")),
             timeout_seconds=float(config.get("timeout_seconds", 12)),
             summary_chars=int(config.get("summary_chars", 200)),
             username=str(config.get("api_username", "")),
@@ -82,13 +89,18 @@ class MediaWikiPlugin(Star):
             max_diff_line_chars=int(config.get("change_diff_line_chars", 180)),
             max_pending=int(config.get("change_pending_limit", 500)),
             include_bot_edits=bool(config.get("change_include_bot_edits", True)),
+            overlap_seconds=int(config.get("change_overlap_seconds", 60)),
+            recent_rcid_limit=int(config.get("change_recent_rcid_limit", 20000)),
+            category_refresh_interval_seconds=int(
+                config.get("change_category_refresh_interval_seconds", 900)
+            ),
             link_prefix_for_umo=self._change_link_prefix,
         )
 
     async def initialize(self):
         if self.change_push_enabled:
             await self.change_monitor.start()
-            logger.info("MediaWiki 分类变更监控已启动")
+            logger.info("MediaWiki 条目/分类变更监控已启动")
 
     @filter.command("wiki", alias={"维基"})
     async def wiki(self, event: AstrMessageEvent):
@@ -194,13 +206,13 @@ class MediaWikiPlugin(Star):
             yield event.plain_result("用法：/wiki监控 分类名")
             return
         try:
-            subscription = await self.change_monitor.subscribe(
+            subscription = await self.change_monitor.subscribe_category(
                 event.unified_msg_origin, raw
             )
             suffix = "（成员数量达到上限，当前为截断监控）" if subscription.truncated else ""
             status = "后台轮询已启用" if self.change_push_enabled else "已保存，但插件配置中的变更推送目前关闭"
             yield event.plain_result(
-                f"✅ 已监控分类：{display_category(subscription.category)}\n"
+                f"✅ 已监控分类：{display_category(subscription.target)}\n"
                 f"当前收录 {len(subscription.member_page_ids)} 个页面，{status}{suffix}。\n"
                 "首次订阅只建立水位，不补发历史变更。"
             )
@@ -214,6 +226,37 @@ class MediaWikiPlugin(Star):
             yield event.plain_result(f"⚠️ 分类监控创建失败：{exc}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("wiki监控条目", alias={"wikiwatchpage"})
+    async def watch_page(self, event: AstrMessageEvent):
+        """订阅单一 Wiki 条目的编辑：/wiki监控条目 条目名。"""
+        raw = self._command_tail(event, self.WATCH_PAGE_COMMAND_NAMES)
+        if not raw:
+            yield event.plain_result("用法：/wiki监控条目 条目名")
+            return
+        try:
+            subscription = await self.change_monitor.subscribe_page(
+                event.unified_msg_origin, raw
+            )
+            status = (
+                "后台轮询已启用"
+                if self.change_push_enabled
+                else "已保存，但插件配置中的变更推送目前关闭"
+            )
+            yield event.plain_result(
+                f"✅ 已监控单一条目：{subscription.target}\n"
+                f"pageid={subscription.page_id}，{status}。\n"
+                "首次订阅只建立水位，不补发历史变更。"
+            )
+        except MediaWikiError as exc:
+            logger.warning("MediaWiki page subscription failed: %s", exc)
+            yield event.plain_result(
+                f"⚠️ 条目监控创建失败：{self._friendly_error(exc)}"
+            )
+        except Exception as exc:
+            logger.exception("Unexpected MediaWiki page subscription error")
+            yield event.plain_result(f"⚠️ 条目监控创建失败：{exc}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("wiki取消监控", alias={"wikiunwatch"})
     async def unwatch_category(self, event: AstrMessageEvent):
         """取消当前会话的 Wiki 分类监控：/wiki取消监控 分类名|全部。"""
@@ -222,31 +265,72 @@ class MediaWikiPlugin(Star):
             yield event.plain_result("用法：/wiki取消监控 分类名；取消全部请填写“全部”。")
             return
         remove_all = raw.casefold() in {"all", "全部"}
-        removed = await self.change_monitor.unsubscribe(
+        if remove_all:
+            removed = await self.change_monitor.unsubscribe_all(
+                event.unified_msg_origin
+            )
+        else:
+            removed = await self.change_monitor.unsubscribe_category(
+                event.unified_msg_origin, raw
+            )
+        if removed:
+            if remove_all:
+                yield event.plain_result(f"✅ 已取消全部 {removed} 项 Wiki 监控。")
+            else:
+                yield event.plain_result(f"✅ 已取消 {removed} 项分类监控。")
+        else:
+            message = (
+                "当前会话没有任何 Wiki 监控。"
+                if remove_all
+                else "当前会话没有匹配的分类监控。"
+            )
+            yield event.plain_result(message)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("wiki取消监控条目", alias={"wikiunwatchpage"})
+    async def unwatch_page(self, event: AstrMessageEvent):
+        """取消单条目监控：/wiki取消监控条目 条目名|全部。"""
+        raw = self._command_tail(event, self.UNWATCH_PAGE_COMMAND_NAMES).strip()
+        if not raw:
+            yield event.plain_result(
+                "用法：/wiki取消监控条目 条目名；取消全部条目请填写“全部”。"
+            )
+            return
+        remove_all = raw.casefold() in {"all", "全部"}
+        removed = await self.change_monitor.unsubscribe_page(
             event.unified_msg_origin, "" if remove_all else raw
         )
         if removed:
-            yield event.plain_result(f"✅ 已取消 {removed} 项分类监控。")
+            yield event.plain_result(f"✅ 已取消 {removed} 项单条目监控。")
         else:
-            yield event.plain_result("当前会话没有匹配的分类监控。")
+            yield event.plain_result("当前会话没有匹配的单条目监控。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("wiki监控列表", alias={"wikiwatchlist"})
+    @filter.command(
+        "wiki监控列表", alias={"wikiwatchlist", "wiki监控条目列表"}
+    )
     async def list_watched_categories(self, event: AstrMessageEvent):
-        """列出当前会话的 Wiki 分类监控。"""
+        """列出当前会话的分类和单条目监控。"""
         subscriptions = await self.change_monitor.subscriptions_for(
             event.unified_msg_origin
         )
         if not subscriptions:
-            yield event.plain_result("当前会话尚未监控任何 Wiki 分类。")
+            yield event.plain_result("当前会话尚未添加任何 Wiki 监控。")
             return
-        lines = ["当前会话的 Wiki 分类监控："]
+        subscriptions.sort(key=lambda item: (item.kind, item.target.casefold()))
+        lines = ["当前会话的 Wiki 监控："]
         for index, subscription in enumerate(subscriptions, start=1):
-            suffix = "，已截断" if subscription.truncated else ""
-            lines.append(
-                f"{index}. {display_category(subscription.category)}"
-                f"（{len(subscription.member_page_ids)} 个页面{suffix}）"
-            )
+            if subscription.kind == SUBSCRIPTION_CATEGORY:
+                suffix = "，已截断" if subscription.truncated else ""
+                lines.append(
+                    f"{index}. [分类] {display_category(subscription.target)}"
+                    f"（{len(subscription.member_page_ids)} 个页面{suffix}）"
+                )
+            elif subscription.kind == SUBSCRIPTION_PAGE:
+                lines.append(
+                    f"{index}. [条目] {subscription.target}"
+                    f"（pageid={subscription.page_id}）"
+                )
         lines.append(
             f"轮询状态：{'已启用' if self.change_push_enabled else '已关闭'}；"
             f"间隔 {self.change_monitor.poll_interval_seconds} 秒。"
@@ -254,9 +338,49 @@ class MediaWikiPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("wiki监控状态", alias={"wikiwatchstatus"})
+    async def wiki_monitor_status(self, event: AstrMessageEvent):
+        """显示 Wiki 监控任务、游标、队列和登录状态。"""
+        status = await self.change_monitor.status_for(event.unified_msg_origin)
+        if self.client.authentication_configured:
+            try:
+                await self.client.ensure_authenticated()
+                auth_status = "Bot Password 已登录"
+            except MediaWikiError as exc:
+                auth_status = self._friendly_error(exc)
+        else:
+            auth_status = "匿名访问"
+        lines = [
+            f"Wiki 监控任务：{'运行中' if status.running else '未运行'}",
+            f"认证：{auth_status}",
+            f"当前会话订阅：{status.current_session_subscriptions}",
+            f"全局订阅：分类 {status.category_subscriptions}，条目 {status.page_subscriptions}",
+            f"待发送队列：{status.pending}",
+            f"变更水位：{status.last_timestamp or '尚未建立'}",
+            f"最后轮询：{status.last_poll_at or '尚未执行'}",
+            f"最后成功：{status.last_success_at or '尚未成功'}",
+        ]
+        if status.last_error:
+            lines.append(f"最近错误：{status.last_error}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("wiki测试推送", alias={"wikiwatchtest"})
+    async def test_wiki_push(self, event: AstrMessageEvent):
+        """向当前会话发送一条主动推送测试消息。"""
+        try:
+            await self._send_change_message(
+                event.unified_msg_origin,
+                "🧪 Wiki 监控主动推送测试成功。\n当前会话可以接收后台变更通知。",
+            )
+        except Exception as exc:
+            logger.exception("MediaWiki test push failed")
+            yield event.plain_result(f"⚠️ Wiki 测试推送失败：{exc}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("wiki检查更新", alias={"wikicheck"})
     async def check_wiki_changes(self, event: AstrMessageEvent):
-        """立即执行一次分类变更检查。"""
+        """立即执行一次 Wiki 条目/分类变更检查。"""
         try:
             result = await self.change_monitor.poll_once()
             yield event.plain_result(
@@ -379,7 +503,23 @@ class MediaWikiPlugin(Star):
     @classmethod
     def _looks_like_plugin_command(cls, event: AstrMessageEvent) -> bool:
         message = re.sub(r"\s+", " ", event.get_message_str().strip()).casefold()
-        names = (*cls.COMMAND_NAMES, *cls.SEARCH_COMMAND_NAMES)
+        names = (
+            *cls.COMMAND_NAMES,
+            *cls.SEARCH_COMMAND_NAMES,
+            *cls.WATCH_COMMAND_NAMES,
+            *cls.UNWATCH_COMMAND_NAMES,
+            *cls.WATCH_PAGE_COMMAND_NAMES,
+            *cls.UNWATCH_PAGE_COMMAND_NAMES,
+            "wiki监控列表",
+            "wikiwatchlist",
+            "wiki监控条目列表",
+            "wiki监控状态",
+            "wikiwatchstatus",
+            "wiki检查更新",
+            "wikicheck",
+            "wiki测试推送",
+            "wikiwatchtest",
+        )
         return any(
             message == name.casefold()
             or message.startswith(name.casefold() + " ")
@@ -426,4 +566,11 @@ class MediaWikiPlugin(Star):
                 f"{exc.info}。请检查登录名（通常为 账号名@机器人名）和密码；"
                 "不要填写账号主密码。"
             )
+        if isinstance(exc, MediaWikiAPIError) and exc.code in {
+            "invalid-title",
+            "interwiki-not-supported",
+            "page-not-found",
+            "page-not-monitorable",
+        }:
+            return exc.info
         return str(exc)

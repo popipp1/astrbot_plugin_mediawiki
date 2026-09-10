@@ -14,7 +14,7 @@ except ModuleNotFoundError:  # Allows pure helper tests before plugin deps are i
     aiohttp = None  # type: ignore[assignment]
 
 
-DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.2.1"
+DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.3.0"
 MAX_TITLES = 5
 
 
@@ -213,6 +213,10 @@ class MediaWikiClient:
     @property
     def authentication_configured(self) -> bool:
         return bool(self.username and self._bot_password)
+
+    @property
+    def is_authenticated(self) -> bool:
+        return self._authenticated
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
@@ -516,6 +520,31 @@ class MediaWikiClient:
             )
         return result
 
+    async def resolve_page(self, raw_title: str) -> WikiPage:
+        """Resolve one local, existing page for a monitoring subscription."""
+        request = split_title(raw_title)
+        if not request.title:
+            raise MediaWikiAPIError("invalid-title", "条目名不能为空")
+        result = await self.query_pages([request])
+        if result.interwiki:
+            raise MediaWikiAPIError(
+                "interwiki-not-supported", "暂不支持监控跨 Wiki 条目"
+            )
+        if not result.pages:
+            raise MediaWikiAPIError("page-not-found", "Wiki API 没有返回该条目")
+        page = result.pages[0]
+        if page.invalid:
+            raise MediaWikiAPIError(
+                "invalid-title", page.invalid_reason or "条目名不合法"
+            )
+        if page.missing:
+            raise MediaWikiAPIError("page-not-found", f"条目“{page.title}”不存在")
+        if page.special or page.pageid is None:
+            raise MediaWikiAPIError(
+                "page-not-monitorable", f"条目“{page.title}”不能加入编辑监控"
+            )
+        return page
+
     async def search(self, keywords: str, limit: int = 5) -> WikiSearchResult:
         keywords = keywords.strip()
         if not keywords:
@@ -666,9 +695,11 @@ class MediaWikiClient:
         *,
         limit: int = 1000,
         include_bot_edits: bool = True,
+        exclude_rcids: set[int] | None = None,
     ) -> list[RecentChange]:
-        """Fetch edit/new entries from oldest to newest since a timestamp."""
+        """Fetch unseen edit/new entries from oldest to newest since a timestamp."""
         limit = max(1, min(int(limit), 10_000))
+        excluded = exclude_rcids or set()
         changes: list[RecentChange] = []
         continuation = ""
         while len(changes) < limit:
@@ -693,12 +724,13 @@ class MediaWikiClient:
                 query.get("recentchanges", []) if isinstance(query, dict) else []
             )
             for raw in _as_list(raw_changes):
+                rcid = int(raw.get("rcid", 0) or 0)
                 revid = int(raw.get("revid", 0) or 0)
-                if revid <= 0:
+                if rcid <= 0 or revid <= 0 or rcid in excluded:
                     continue
                 changes.append(
                     RecentChange(
-                        rcid=int(raw.get("rcid", 0) or 0),
+                        rcid=rcid,
                         change_type=str(raw.get("type", "edit")),
                         namespace=int(raw.get("ns", 0) or 0),
                         title=str(raw.get("title", "")).strip(),

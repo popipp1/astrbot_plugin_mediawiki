@@ -24,7 +24,7 @@
     "description": "HTTP User-Agent",
     "type": "string",
     "hint": "部分 Wiki 要求使用可识别的 User-Agent；建议包含机器人名称和联系方式。",
-    "default": "AstrBot-MediaWiki/1.2.1"
+    "default": "AstrBot-MediaWiki/1.3.0"
   },
   "timeout_seconds": {
     "description": "请求超时秒数",
@@ -61,13 +61,13 @@
     "default": ""
   },
   "change_push_enabled": {
-    "description": "启用分类变更推送",
+    "description": "启用 Wiki 变更推送",
     "type": "bool",
-    "hint": "启用后定时检查通过 /wiki监控 添加的分类，并主动推送到订阅会话。",
+    "hint": "启用后定时检查通过 /wiki监控 和 /wiki监控条目 添加的订阅，并主动推送到订阅会话。",
     "default": true
   },
   "change_poll_interval_seconds": {
-    "description": "分类变更检查间隔（秒）",
+    "description": "Wiki 变更检查间隔（秒）",
     "type": "int",
     "hint": "最小 30 秒；建议 120 秒或更长，避免给 Wiki API 造成压力。",
     "default": 120
@@ -77,6 +77,12 @@
     "type": "int",
     "hint": "0 表示仅直接成员，1 表示再展开一层子分类；最大 10。",
     "default": 2
+  },
+  "change_category_refresh_interval_seconds": {
+    "description": "分类树刷新间隔（秒）",
+    "type": "int",
+    "hint": "分类成员树独立低频刷新；相同分类只请求一次。最小 60 秒，默认 900 秒。",
+    "default": 900
   },
   "change_max_members": {
     "description": "单项监控的最大页面数",
@@ -89,6 +95,18 @@
     "type": "int",
     "hint": "超出部分会保留时间水位并在后续轮次继续读取。",
     "default": 1000
+  },
+  "change_overlap_seconds": {
+    "description": "最近更改重叠窗口（秒）",
+    "type": "int",
+    "hint": "每次从水位前若干秒重新读取并按 RCID 去重，用于接住延迟写入的更改；最大 600 秒。",
+    "default": 60
+  },
+  "change_recent_rcid_limit": {
+    "description": "持久化 RCID 去重数量",
+    "type": "int",
+    "hint": "保存最近已处理的变更 ID，避免重叠轮询重复推送；范围 1000–100000。",
+    "default": 20000
   },
   "change_diff_lines": {
     "description": "每条推送最多显示的差异行数",

@@ -5,9 +5,10 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ try:
         MediaWikiClient,
         RecentChange,
         get_index_url,
+        normalize_title,
     )
 except ImportError:  # Allows the helpers to be tested outside AstrBot.
     from mediawiki_client import (  # type: ignore[no-redef]
@@ -25,11 +27,14 @@ except ImportError:  # Allows the helpers to be tested outside AstrBot.
         MediaWikiClient,
         RecentChange,
         get_index_url,
+        normalize_title,
     )
 
 
 LOGGER = logging.getLogger(__name__)
-STATE_VERSION = 1
+STATE_VERSION = 2
+SUBSCRIPTION_CATEGORY = "category"
+SUBSCRIPTION_PAGE = "page"
 
 
 def normalize_category(raw: str) -> str:
@@ -42,6 +47,25 @@ def normalize_category(raw: str) -> str:
 
 def display_category(category: str) -> str:
     return re.sub(r"^(?:category|分类)\s*[:：]\s*", "", category, flags=re.I)
+
+
+def _utc_now() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def overlap_timestamp(timestamp: str, seconds: int) -> str:
+    """Move an API cursor backwards to include late RecentChanges rows."""
+    try:
+        moment = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        return (moment - timedelta(seconds=max(0, int(seconds)))).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
+    except (TypeError, ValueError):
+        return timestamp
 
 
 @dataclass(slots=True, frozen=True)
@@ -130,13 +154,16 @@ def _local_clock(timestamp: str) -> str:
 
 def format_change_notification(
     change: RecentChange,
-    categories: list[str],
+    scopes: list[str],
     diff_lines: list[DiffLine],
     *,
     api_url: str,
     link_prefix: str = "",
 ) -> str:
-    category_text = "、".join(display_category(item) for item in categories)
+    scope_text = "、".join(
+        display_category(item) if item.casefold().startswith("category:") else item
+        for item in scopes
+    )
     delta = f"{change.size_delta:+d}"
     flags = ""
     if change.change_type == "new":
@@ -150,7 +177,7 @@ def format_change_notification(
         link = f"{link_prefix}{link}"
     lines = [
         change.title,
-        f"§ {category_text}",
+        f"§ {scope_text}",
         f"{delta}{flags} | {change.user} | {_local_clock(change.timestamp)}",
         link,
     ]
@@ -165,15 +192,23 @@ def format_change_notification(
 @dataclass(slots=True)
 class ChangeSubscription:
     umo: str
-    category: str
+    kind: str
+    target: str
     start_timestamp: str
+    page_id: int = 0
     member_page_ids: list[int] = field(default_factory=list)
     member_titles: list[str] = field(default_factory=list)
     truncated: bool = False
 
     @property
-    def key(self) -> tuple[str, str]:
-        return self.umo, self.category.casefold()
+    def key(self) -> tuple[str, str, str]:
+        return self.umo, self.kind, self.target.casefold()
+
+    @property
+    def label(self) -> str:
+        if self.kind == SUBSCRIPTION_PAGE:
+            return f"单条目：{self.target}"
+        return self.target
 
 
 @dataclass(slots=True)
@@ -191,7 +226,7 @@ class PendingNotification:
 class MonitorState:
     version: int = STATE_VERSION
     last_timestamp: str = ""
-    seen_rcids_at_timestamp: list[int] = field(default_factory=list)
+    recent_rcids: list[int] = field(default_factory=list)
     subscriptions: list[ChangeSubscription] = field(default_factory=list)
     pending: list[PendingNotification] = field(default_factory=list)
 
@@ -206,6 +241,19 @@ class PollResult:
     bootstrapped: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class MonitorStatus:
+    running: bool
+    category_subscriptions: int
+    page_subscriptions: int
+    current_session_subscriptions: int
+    pending: int
+    last_timestamp: str
+    last_poll_at: str
+    last_success_at: str
+    last_error: str
+
+
 class JsonStateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -218,18 +266,33 @@ class JsonStateStore:
             return MonitorState()
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            subscriptions = [
-                ChangeSubscription(
-                    umo=str(item.get("umo", "")),
-                    category=str(item.get("category", "")),
-                    start_timestamp=str(item.get("start_timestamp", "")),
-                    member_page_ids=[int(value) for value in item.get("member_page_ids", [])],
-                    member_titles=[str(value) for value in item.get("member_titles", [])],
-                    truncated=bool(item.get("truncated", False)),
+            subscriptions: list[ChangeSubscription] = []
+            for item in raw.get("subscriptions", []):
+                if not isinstance(item, dict) or not item.get("umo"):
+                    continue
+                # State v1 only had category subscriptions. Reading the old
+                # field here makes upgrades transparent and the next save
+                # writes the v2 representation.
+                kind = str(item.get("kind") or SUBSCRIPTION_CATEGORY)
+                target = str(item.get("target") or item.get("category") or "")
+                if kind not in {SUBSCRIPTION_CATEGORY, SUBSCRIPTION_PAGE} or not target:
+                    continue
+                subscriptions.append(
+                    ChangeSubscription(
+                        umo=str(item.get("umo", "")),
+                        kind=kind,
+                        target=target,
+                        start_timestamp=str(item.get("start_timestamp", "")),
+                        page_id=int(item.get("page_id", 0) or 0),
+                        member_page_ids=[
+                            int(value) for value in item.get("member_page_ids", [])
+                        ],
+                        member_titles=[
+                            str(value) for value in item.get("member_titles", [])
+                        ],
+                        truncated=bool(item.get("truncated", False)),
+                    )
                 )
-                for item in raw.get("subscriptions", [])
-                if isinstance(item, dict) and item.get("umo") and item.get("category")
-            ]
             pending = [
                 PendingNotification(
                     umo=str(item.get("umo", "")),
@@ -244,13 +307,17 @@ class JsonStateStore:
             return MonitorState(
                 version=STATE_VERSION,
                 last_timestamp=str(raw.get("last_timestamp", "")),
-                seen_rcids_at_timestamp=[
-                    int(value) for value in raw.get("seen_rcids_at_timestamp", [])
+                recent_rcids=[
+                    int(value)
+                    for value in (
+                        raw.get("recent_rcids")
+                        or raw.get("seen_rcids_at_timestamp", [])
+                    )
                 ],
                 subscriptions=subscriptions,
                 pending=pending,
             )
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        except (AttributeError, OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             LOGGER.warning("Unable to read MediaWiki change state %s: %s", self.path, exc)
             return MonitorState()
 
@@ -262,7 +329,7 @@ class JsonStateStore:
         payload = {
             "version": STATE_VERSION,
             "last_timestamp": state.last_timestamp,
-            "seen_rcids_at_timestamp": state.seen_rcids_at_timestamp,
+            "recent_rcids": state.recent_rcids,
             "subscriptions": [asdict(item) for item in state.subscriptions],
             "pending": [asdict(item) for item in state.pending],
         }
@@ -289,6 +356,9 @@ class WikiChangeMonitor:
         max_diff_line_chars: int = 180,
         max_pending: int = 500,
         include_bot_edits: bool = True,
+        overlap_seconds: int = 60,
+        recent_rcid_limit: int = 20_000,
+        category_refresh_interval_seconds: int = 900,
         link_prefix_for_umo: Callable[[str], str] | None = None,
     ) -> None:
         self.client = client
@@ -302,12 +372,21 @@ class WikiChangeMonitor:
         self.max_diff_line_chars = max(20, min(int(max_diff_line_chars), 1000))
         self.max_pending = max(1, min(int(max_pending), 10_000))
         self.include_bot_edits = include_bot_edits
+        self.overlap_seconds = max(0, min(int(overlap_seconds), 600))
+        self.recent_rcid_limit = max(1000, min(int(recent_rcid_limit), 100_000))
+        self.category_refresh_interval_seconds = max(
+            60, min(int(category_refresh_interval_seconds), 86_400)
+        )
         self.link_prefix_for_umo = link_prefix_for_umo or (lambda _umo: "")
         self.state = MonitorState()
         self._loaded = False
         self._lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
+        self._category_refresh_at: dict[str, float] = {}
+        self.last_poll_at = ""
+        self.last_success_at = ""
+        self.last_error = ""
 
     async def load(self) -> None:
         if not self._loaded:
@@ -343,11 +422,25 @@ class WikiChangeMonitor:
                 LOGGER.exception("MediaWiki change polling failed")
             await asyncio.sleep(self.poll_interval_seconds)
 
-    async def subscribe(self, umo: str, raw_category: str) -> ChangeSubscription:
-        await self.load()
-        umo = str(umo).strip()
-        if not umo:
+    @staticmethod
+    def _validated_umo(umo: str) -> str:
+        value = str(umo).strip()
+        if not value:
             raise ValueError("当前消息平台没有提供可用于主动推送的会话标识")
+        return value
+
+    def _reset_cursor_if_empty(self) -> None:
+        if self.state.subscriptions:
+            return
+        self.state.last_timestamp = ""
+        self.state.recent_rcids = []
+        self.state.pending = []
+
+    async def subscribe_category(
+        self, umo: str, raw_category: str
+    ) -> ChangeSubscription:
+        await self.load()
+        umo = self._validated_umo(umo)
         category = normalize_category(raw_category)
         snapshot = await self.client.category_tree(
             category,
@@ -360,7 +453,9 @@ class WikiChangeMonitor:
                 (
                     item
                     for item in self.state.subscriptions
-                    if item.umo == umo and item.category.casefold() == category.casefold()
+                    if item.umo == umo
+                    and item.kind == SUBSCRIPTION_CATEGORY
+                    and item.target.casefold() == category.casefold()
                 ),
                 None,
             )
@@ -369,10 +464,12 @@ class WikiChangeMonitor:
                 existing.member_titles = sorted(snapshot.titles)
                 existing.truncated = snapshot.truncated
                 await self.store.save(self.state)
+                self._category_refresh_at[category.casefold()] = time.monotonic()
                 return existing
             subscription = ChangeSubscription(
                 umo=umo,
-                category=category,
+                kind=SUBSCRIPTION_CATEGORY,
+                target=category,
                 start_timestamp=now,
                 member_page_ids=sorted(snapshot.page_ids),
                 member_titles=sorted(snapshot.titles),
@@ -381,11 +478,55 @@ class WikiChangeMonitor:
             self.state.subscriptions.append(subscription)
             if not self.state.last_timestamp:
                 self.state.last_timestamp = now
-                self.state.seen_rcids_at_timestamp = []
+                self.state.recent_rcids = []
+            await self.store.save(self.state)
+            self._category_refresh_at[category.casefold()] = time.monotonic()
+            return subscription
+
+    async def subscribe_page(self, umo: str, raw_title: str) -> ChangeSubscription:
+        await self.load()
+        umo = self._validated_umo(umo)
+        page = await self.client.resolve_page(raw_title)
+        now = await self.client.server_timestamp()
+        page_id = int(page.pageid or 0)
+        async with self._lock:
+            existing = next(
+                (
+                    item
+                    for item in self.state.subscriptions
+                    if item.umo == umo
+                    and item.kind == SUBSCRIPTION_PAGE
+                    and (
+                        (page_id > 0 and item.page_id == page_id)
+                        or item.target.casefold() == page.title.casefold()
+                    )
+                ),
+                None,
+            )
+            if existing:
+                existing.target = page.title
+                existing.page_id = page_id
+                await self.store.save(self.state)
+                return existing
+            subscription = ChangeSubscription(
+                umo=umo,
+                kind=SUBSCRIPTION_PAGE,
+                target=page.title,
+                page_id=page_id,
+                start_timestamp=now,
+            )
+            self.state.subscriptions.append(subscription)
+            if not self.state.last_timestamp:
+                self.state.last_timestamp = now
+                self.state.recent_rcids = []
             await self.store.save(self.state)
             return subscription
 
-    async def unsubscribe(self, umo: str, raw_category: str = "") -> int:
+    async def subscribe(self, umo: str, raw_category: str) -> ChangeSubscription:
+        """Backward-compatible alias for category subscriptions."""
+        return await self.subscribe_category(umo, raw_category)
+
+    async def unsubscribe_category(self, umo: str, raw_category: str = "") -> int:
         await self.load()
         category = normalize_category(raw_category) if raw_category.strip() else ""
         async with self._lock:
@@ -395,22 +536,69 @@ class WikiChangeMonitor:
                 for item in self.state.subscriptions
                 if not (
                     item.umo == umo
-                    and (not category or item.category.casefold() == category.casefold())
+                    and item.kind == SUBSCRIPTION_CATEGORY
+                    and (
+                        not category
+                        or item.target.casefold() == category.casefold()
+                    )
                 )
             ]
             removed = before - len(self.state.subscriptions)
-            if not self.state.subscriptions:
-                self.state.last_timestamp = ""
-                self.state.seen_rcids_at_timestamp = []
-                self.state.pending = []
+            self._reset_cursor_if_empty()
             await self.store.save(self.state)
             return removed
+
+    async def unsubscribe_page(self, umo: str, raw_title: str = "") -> int:
+        await self.load()
+        title = normalize_title(raw_title) if raw_title.strip() else ""
+        async with self._lock:
+            before = len(self.state.subscriptions)
+            self.state.subscriptions = [
+                item
+                for item in self.state.subscriptions
+                if not (
+                    item.umo == umo
+                    and item.kind == SUBSCRIPTION_PAGE
+                    and (not title or item.target.casefold() == title.casefold())
+                )
+            ]
+            removed = before - len(self.state.subscriptions)
+            self._reset_cursor_if_empty()
+            await self.store.save(self.state)
+            return removed
+
+    async def unsubscribe_all(self, umo: str) -> int:
+        await self.load()
+        async with self._lock:
+            before = len(self.state.subscriptions)
+            self.state.subscriptions = [
+                item for item in self.state.subscriptions if item.umo != umo
+            ]
+            removed = before - len(self.state.subscriptions)
+            self._reset_cursor_if_empty()
+            await self.store.save(self.state)
+            return removed
+
+    async def unsubscribe(self, umo: str, raw_category: str = "") -> int:
+        """Backward-compatible alias for category unsubscription."""
+        return await self.unsubscribe_category(umo, raw_category)
 
     async def subscriptions_for(self, umo: str) -> list[ChangeSubscription]:
         await self.load()
         return [item for item in self.state.subscriptions if item.umo == umo]
 
     async def poll_once(self) -> PollResult:
+        self.last_poll_at = _utc_now()
+        try:
+            result = await self._poll_once()
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"[:500]
+            raise
+        self.last_success_at = _utc_now()
+        self.last_error = ""
+        return result
+
+    async def _poll_once(self) -> PollResult:
         await self.load()
         async with self._lock:
             result = PollResult()
@@ -427,24 +615,19 @@ class WikiChangeMonitor:
             await self._refresh_memberships()
             if not self.state.last_timestamp:
                 self.state.last_timestamp = await self.client.server_timestamp()
-                self.state.seen_rcids_at_timestamp = []
+                self.state.recent_rcids = []
                 result.bootstrapped = True
                 await self.store.save(self.state)
                 return result
 
+            seen = set(self.state.recent_rcids)
             changes = await self.client.recent_changes(
-                self.state.last_timestamp,
+                overlap_timestamp(self.state.last_timestamp, self.overlap_seconds),
                 limit=self.max_changes_per_poll,
                 include_bot_edits=self.include_bot_edits,
+                exclude_rcids=seen,
             )
-            seen = set(self.state.seen_rcids_at_timestamp)
-            changes = [
-                item
-                for item in changes
-                if not (
-                    item.timestamp == self.state.last_timestamp and item.rcid in seen
-                )
-            ]
+            changes = [item for item in changes if item.rcid not in seen]
             result.fetched = len(changes)
             pending_keys = {item.key for item in self.state.pending}
             consumed: list[RecentChange] = []
@@ -452,8 +635,8 @@ class WikiChangeMonitor:
             for change in changes:
                 targets = self._matching_targets(change, previous_members)
                 new_targets = [
-                    (umo, categories)
-                    for umo, categories in targets.items()
+                    (umo, scopes)
+                    for umo, scopes in targets.items()
                     if (umo, change.rcid) not in pending_keys
                 ]
                 if len(self.state.pending) + len(new_targets) > self.max_pending:
@@ -478,10 +661,10 @@ class WikiChangeMonitor:
                         LOGGER.exception(
                             "Unable to fetch MediaWiki diff for revision %s", change.revid
                         )
-                for umo, categories in new_targets:
+                for umo, scopes in new_targets:
                     message = format_change_notification(
                         change,
-                        categories,
+                        scopes,
                         diff_lines,
                         api_url=self.client.api_url,
                         link_prefix=self.link_prefix_for_umo(umo),
@@ -493,21 +676,17 @@ class WikiChangeMonitor:
                 consumed.append(change)
 
             if consumed:
-                latest_timestamp = consumed[-1].timestamp
-                if latest_timestamp == self.state.last_timestamp:
-                    updated_seen = seen | {
-                        item.rcid
-                        for item in consumed
-                        if item.timestamp == latest_timestamp
-                    }
-                else:
-                    updated_seen = {
-                        item.rcid
-                        for item in consumed
-                        if item.timestamp == latest_timestamp
-                    }
-                self.state.last_timestamp = latest_timestamp
-                self.state.seen_rcids_at_timestamp = sorted(updated_seen)
+                timestamps = [item.timestamp for item in consumed if item.timestamp]
+                if timestamps:
+                    self.state.last_timestamp = max(
+                        [self.state.last_timestamp, *timestamps]
+                    )
+                deduplicated = list(
+                    dict.fromkeys(
+                        [*self.state.recent_rcids, *(item.rcid for item in consumed)]
+                    )
+                )
+                self.state.recent_rcids = deduplicated[-self.recent_rcid_limit :]
 
             await self.store.save(self.state)
             sent, failed = await self._deliver_pending()
@@ -516,46 +695,89 @@ class WikiChangeMonitor:
             return result
 
     async def _refresh_memberships(self) -> None:
+        grouped: dict[str, list[ChangeSubscription]] = {}
         for subscription in self.state.subscriptions:
+            if subscription.kind != SUBSCRIPTION_CATEGORY:
+                continue
+            grouped.setdefault(subscription.target.casefold(), []).append(subscription)
+
+        now = time.monotonic()
+        for key, subscriptions in grouped.items():
+            refreshed_at = self._category_refresh_at.get(key, 0.0)
+            if now - refreshed_at < self.category_refresh_interval_seconds:
+                continue
+            category = subscriptions[0].target
             try:
                 snapshot: CategorySnapshot = await self.client.category_tree(
-                    subscription.category,
+                    category,
                     max_depth=self.category_depth,
                     max_members=self.max_members,
                 )
-                subscription.member_page_ids = sorted(snapshot.page_ids)
-                subscription.member_titles = sorted(snapshot.titles)
-                subscription.truncated = snapshot.truncated
+                for subscription in subscriptions:
+                    subscription.member_page_ids = sorted(snapshot.page_ids)
+                    subscription.member_titles = sorted(snapshot.titles)
+                    subscription.truncated = snapshot.truncated
+                self._category_refresh_at[key] = now
             except Exception:
                 LOGGER.exception(
-                    "Unable to refresh MediaWiki category %s", subscription.category
+                    "Unable to refresh MediaWiki category %s", category
                 )
 
     def _matching_targets(
         self,
         change: RecentChange,
-        previous_members: dict[tuple[str, str], tuple[set[int], set[str]]],
+        previous_members: dict[
+            tuple[str, str, str], tuple[set[int], set[str]]
+        ],
     ) -> dict[str, list[str]]:
         targets: dict[str, list[str]] = {}
         for subscription in self.state.subscriptions:
-            previous_ids, previous_titles = previous_members.get(
-                subscription.key, (set(), set())
-            )
-            current_ids = set(subscription.member_page_ids)
-            current_titles = set(subscription.member_titles)
-            matches = (
-                (change.pageid > 0 and change.pageid in (previous_ids | current_ids))
-                or change.title.casefold() in (previous_titles | current_titles)
-            )
+            if subscription.kind == SUBSCRIPTION_PAGE:
+                matches = (
+                    change.pageid > 0
+                    and subscription.page_id > 0
+                    and change.pageid == subscription.page_id
+                ) or change.title.casefold() == subscription.target.casefold()
+                if matches and change.pageid == subscription.page_id and change.title:
+                    subscription.target = change.title
+            else:
+                previous_ids, previous_titles = previous_members.get(
+                    subscription.key, (set(), set())
+                )
+                current_ids = set(subscription.member_page_ids)
+                current_titles = set(subscription.member_titles)
+                matches = (
+                    change.pageid > 0
+                    and change.pageid in (previous_ids | current_ids)
+                ) or change.title.casefold() in (previous_titles | current_titles)
             if not matches or (
                 subscription.start_timestamp
                 and change.timestamp < subscription.start_timestamp
             ):
                 continue
-            categories = targets.setdefault(subscription.umo, [])
-            if subscription.category not in categories:
-                categories.append(subscription.category)
+            scopes = targets.setdefault(subscription.umo, [])
+            if subscription.label not in scopes:
+                scopes.append(subscription.label)
         return targets
+
+    async def status_for(self, umo: str) -> MonitorStatus:
+        await self.load()
+        current = [item for item in self.state.subscriptions if item.umo == umo]
+        return MonitorStatus(
+            running=bool(self._task and not self._task.done()),
+            category_subscriptions=sum(
+                item.kind == SUBSCRIPTION_CATEGORY for item in self.state.subscriptions
+            ),
+            page_subscriptions=sum(
+                item.kind == SUBSCRIPTION_PAGE for item in self.state.subscriptions
+            ),
+            current_session_subscriptions=len(current),
+            pending=len(self.state.pending),
+            last_timestamp=self.state.last_timestamp,
+            last_poll_at=self.last_poll_at,
+            last_success_at=self.last_success_at,
+            last_error=self.last_error,
+        )
 
     async def _deliver_pending(self) -> tuple[int, int]:
         if not self.state.pending:
