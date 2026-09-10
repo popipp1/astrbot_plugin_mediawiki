@@ -13,7 +13,7 @@ except ModuleNotFoundError:  # Allows pure helper tests before plugin deps are i
     aiohttp = None  # type: ignore[assignment]
 
 
-DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.0"
+DEFAULT_USER_AGENT = "AstrBot-MediaWiki/1.2"
 MAX_TITLES = 5
 
 
@@ -76,6 +76,44 @@ class WikiQueryResult:
 class WikiSearchResult:
     total_hits: int
     pages: list[WikiPage] = field(default_factory=list)
+
+
+@dataclass(slots=True, frozen=True)
+class CategoryMember:
+    pageid: int
+    namespace: int
+    title: str
+    member_type: str
+
+
+@dataclass(slots=True)
+class CategorySnapshot:
+    page_ids: set[int] = field(default_factory=set)
+    titles: set[str] = field(default_factory=set)
+    categories: list[str] = field(default_factory=list)
+    truncated: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class RecentChange:
+    rcid: int
+    change_type: str
+    namespace: int
+    title: str
+    pageid: int
+    revid: int
+    old_revid: int
+    user: str
+    timestamp: str
+    comment: str
+    old_length: int
+    new_length: int
+    bot: bool = False
+    minor: bool = False
+
+    @property
+    def size_delta(self) -> int:
+        return self.new_length - self.old_length
 
 
 def normalize_title(raw: str) -> str:
@@ -406,6 +444,189 @@ class MediaWikiClient:
             for page in raw_pages
         ]
         return WikiSearchResult(total_hits=total_hits, pages=pages)
+
+    async def server_timestamp(self) -> str:
+        """Return the wiki server clock in MediaWiki timestamp format."""
+        params = self._base_query_params()
+        params["curtimestamp"] = "1"
+        data = await self._request(params)
+        timestamp = str(data.get("curtimestamp", "")).strip()
+        if not timestamp:
+            raise MediaWikiHTTPError("Wiki API 响应缺少 curtimestamp 字段")
+        return timestamp
+
+    async def category_tree(
+        self,
+        root_category: str,
+        *,
+        max_depth: int = 2,
+        max_members: int = 5000,
+    ) -> CategorySnapshot:
+        """Recursively enumerate a category tree using categorymembers."""
+        max_depth = max(0, min(int(max_depth), 10))
+        max_members = max(1, min(int(max_members), 100_000))
+        queue: list[tuple[str, int]] = [(root_category, 0)]
+        visited: set[str] = set()
+        snapshot = CategorySnapshot()
+
+        while queue and len(snapshot.page_ids) < max_members:
+            category, depth = queue.pop(0)
+            key = category.casefold()
+            if key in visited:
+                continue
+            visited.add(key)
+            snapshot.categories.append(category)
+            continuation = ""
+
+            while len(snapshot.page_ids) < max_members:
+                params = self._base_query_params()
+                params.update(
+                    {
+                        "list": "categorymembers",
+                        "cmtitle": category,
+                        "cmprop": "ids|title|type",
+                        "cmtype": "page|subcat|file",
+                        "cmlimit": "max",
+                    }
+                )
+                if continuation:
+                    params["cmcontinue"] = continuation
+                data = await self._request(params)
+                query = data.get("query", {})
+                raw_members = (
+                    query.get("categorymembers", [])
+                    if isinstance(query, dict)
+                    else []
+                )
+                for raw in _as_list(raw_members):
+                    member = CategoryMember(
+                        pageid=int(raw.get("pageid", 0) or 0),
+                        namespace=int(raw.get("ns", 0) or 0),
+                        title=str(raw.get("title", "")).strip(),
+                        member_type=str(raw.get("type", "page")),
+                    )
+                    if member.pageid > 0:
+                        snapshot.page_ids.add(member.pageid)
+                    if member.title:
+                        snapshot.titles.add(member.title.casefold())
+                    if (
+                        member.member_type == "subcat"
+                        and member.title
+                        and depth < max_depth
+                    ):
+                        queue.append((member.title, depth + 1))
+                    if len(snapshot.page_ids) >= max_members:
+                        snapshot.truncated = True
+                        break
+
+                raw_continue = data.get("continue", {})
+                continuation = (
+                    str(raw_continue.get("cmcontinue", ""))
+                    if isinstance(raw_continue, dict)
+                    else ""
+                )
+                if not continuation or snapshot.truncated:
+                    break
+
+        if queue:
+            snapshot.truncated = True
+        return snapshot
+
+    async def recent_changes(
+        self,
+        since: str,
+        *,
+        limit: int = 1000,
+        include_bot_edits: bool = True,
+    ) -> list[RecentChange]:
+        """Fetch edit/new entries from oldest to newest since a timestamp."""
+        limit = max(1, min(int(limit), 10_000))
+        changes: list[RecentChange] = []
+        continuation = ""
+        while len(changes) < limit:
+            params = self._base_query_params()
+            params.update(
+                {
+                    "list": "recentchanges",
+                    "rcstart": since,
+                    "rcdir": "newer",
+                    "rctype": "edit|new",
+                    "rcprop": "title|ids|sizes|flags|user|timestamp|comment|tags",
+                    "rclimit": "max",
+                }
+            )
+            if not include_bot_edits:
+                params["rcshow"] = "!bot"
+            if continuation:
+                params["rccontinue"] = continuation
+            data = await self._request(params)
+            query = data.get("query", {})
+            raw_changes = (
+                query.get("recentchanges", []) if isinstance(query, dict) else []
+            )
+            for raw in _as_list(raw_changes):
+                revid = int(raw.get("revid", 0) or 0)
+                if revid <= 0:
+                    continue
+                changes.append(
+                    RecentChange(
+                        rcid=int(raw.get("rcid", 0) or 0),
+                        change_type=str(raw.get("type", "edit")),
+                        namespace=int(raw.get("ns", 0) or 0),
+                        title=str(raw.get("title", "")).strip(),
+                        pageid=int(raw.get("pageid", 0) or 0),
+                        revid=revid,
+                        old_revid=int(raw.get("old_revid", 0) or 0),
+                        user=str(raw.get("user", "（用户名已隐藏）")),
+                        timestamp=str(raw.get("timestamp", "")),
+                        comment=str(raw.get("comment", "")).strip(),
+                        old_length=int(raw.get("oldlen", 0) or 0),
+                        new_length=int(raw.get("newlen", 0) or 0),
+                        bot="bot" in raw,
+                        minor="minor" in raw,
+                    )
+                )
+                if len(changes) >= limit:
+                    break
+
+            raw_continue = data.get("continue", {})
+            continuation = (
+                str(raw_continue.get("rccontinue", ""))
+                if isinstance(raw_continue, dict)
+                else ""
+            )
+            if not continuation or len(changes) >= limit:
+                break
+        return changes
+
+    async def compare_revisions(self, old_revid: int, revid: int) -> str:
+        """Return the HTML table rows generated by action=compare."""
+        params = {
+            "action": "compare",
+            "format": "json",
+            "formatversion": "2",
+            "errorformat": "plaintext",
+            "utf8": "1",
+            "maxlag": "5",
+            "torev": str(int(revid)),
+            "prop": "diff",
+            "difftype": "table",
+        }
+        if old_revid > 0:
+            params["fromrev"] = str(int(old_revid))
+        else:
+            params["fromslots"] = "main"
+            params["fromtext-main"] = ""
+            params["fromcontentmodel-main"] = "wikitext"
+        data = await self._request(params)
+        compare = data.get("compare", {})
+        if not isinstance(compare, dict):
+            return ""
+        for key in ("body", "*", "diff"):
+            value = compare.get(key)
+            if isinstance(value, str):
+                return value
+        return ""
 
     @staticmethod
     def _dangerous_special_pages(query: dict[str, Any]) -> tuple[set[str], str]:

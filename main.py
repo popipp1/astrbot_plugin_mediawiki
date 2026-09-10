@@ -2,11 +2,22 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from pathlib import Path
 from urllib.parse import quote
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
+
+try:
+    from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+except ImportError:  # Compatibility with AstrBot releases before this helper.
+    from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+    def get_astrbot_plugin_data_path() -> str:
+        return str(Path(get_astrbot_data_path()) / "plugin_data")
+
+from .change_monitor import WikiChangeMonitor, display_category
 
 from .mediawiki_client import (
     InterwikiPage,
@@ -24,14 +35,16 @@ from .mediawiki_client import (
 @register(
     "astrbot_plugin_mediawiki",
     "Lukec",
-    "MediaWiki 页面摘要与链接查询",
-    "1.1.0",
+    "MediaWiki 页面查询与分类变更推送",
+    "1.2.0",
 )
 class MediaWikiPlugin(Star):
     """Query page summaries and links through the MediaWiki Action API."""
 
     COMMAND_NAMES = ("wiki", "维基")
     SEARCH_COMMAND_NAMES = ("wiki搜索", "wikisearch")
+    WATCH_COMMAND_NAMES = ("wiki监控", "wikiwatch")
+    UNWATCH_COMMAND_NAMES = ("wiki取消监控", "wikiunwatch")
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -40,13 +53,40 @@ class MediaWikiPlugin(Star):
         self.search_if_missing = bool(config.get("search_if_missing", False))
         self.auto_expand_brackets = bool(config.get("auto_expand_brackets", False))
         self.qq_link_prefix = str(config.get("qq_link_prefix", "")).strip()
+        self.change_push_enabled = bool(config.get("change_push_enabled", True))
 
         self.client = MediaWikiClient(
             str(config.get("api_url", "https://zh.wikipedia.org/w/api.php")),
-            user_agent=str(config.get("user_agent", "AstrBot-MediaWiki/1.0")),
+            user_agent=str(config.get("user_agent", "AstrBot-MediaWiki/1.2")),
             timeout_seconds=float(config.get("timeout_seconds", 12)),
             summary_chars=int(config.get("summary_chars", 200)),
         )
+        state_path = (
+            Path(get_astrbot_plugin_data_path())
+            / "astrbot_plugin_mediawiki"
+            / "change_monitor.json"
+        )
+        self.change_monitor = WikiChangeMonitor(
+            self.client,
+            state_path,
+            self._send_change_message,
+            poll_interval_seconds=int(config.get("change_poll_interval_seconds", 120)),
+            category_depth=int(config.get("change_category_depth", 2)),
+            max_members=int(config.get("change_max_members", 5000)),
+            max_changes_per_poll=int(
+                config.get("change_max_changes_per_poll", 1000)
+            ),
+            max_diff_lines=int(config.get("change_diff_lines", 5)),
+            max_diff_line_chars=int(config.get("change_diff_line_chars", 180)),
+            max_pending=int(config.get("change_pending_limit", 500)),
+            include_bot_edits=bool(config.get("change_include_bot_edits", True)),
+            link_prefix_for_umo=self._change_link_prefix,
+        )
+
+    async def initialize(self):
+        if self.change_push_enabled:
+            await self.change_monitor.start()
+            logger.info("MediaWiki 分类变更监控已启动")
 
     @filter.command("wiki", alias={"维基"})
     async def wiki(self, event: AstrMessageEvent):
@@ -143,8 +183,106 @@ class MediaWikiPlugin(Star):
                 yield event.plain_result(f"⚠️ Wiki 查询失败：{exc}")
                 event.stop_event()
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("wiki监控", alias={"wikiwatch"})
+    async def watch_category(self, event: AstrMessageEvent):
+        """订阅当前会话的 Wiki 分类变更：/wiki监控 分类名。"""
+        raw = self._command_tail(event, self.WATCH_COMMAND_NAMES)
+        if not raw:
+            yield event.plain_result("用法：/wiki监控 分类名")
+            return
+        try:
+            subscription = await self.change_monitor.subscribe(
+                event.unified_msg_origin, raw
+            )
+            suffix = "（成员数量达到上限，当前为截断监控）" if subscription.truncated else ""
+            status = "后台轮询已启用" if self.change_push_enabled else "已保存，但插件配置中的变更推送目前关闭"
+            yield event.plain_result(
+                f"✅ 已监控分类：{display_category(subscription.category)}\n"
+                f"当前收录 {len(subscription.member_page_ids)} 个页面，{status}{suffix}。\n"
+                "首次订阅只建立水位，不补发历史变更。"
+            )
+        except MediaWikiError as exc:
+            logger.warning("MediaWiki category subscription failed: %s", exc)
+            yield event.plain_result(
+                f"⚠️ 分类监控创建失败：{self._friendly_error(exc)}"
+            )
+        except Exception as exc:
+            logger.exception("Unexpected MediaWiki category subscription error")
+            yield event.plain_result(f"⚠️ 分类监控创建失败：{exc}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("wiki取消监控", alias={"wikiunwatch"})
+    async def unwatch_category(self, event: AstrMessageEvent):
+        """取消当前会话的 Wiki 分类监控：/wiki取消监控 分类名|全部。"""
+        raw = self._command_tail(event, self.UNWATCH_COMMAND_NAMES).strip()
+        if not raw:
+            yield event.plain_result("用法：/wiki取消监控 分类名；取消全部请填写“全部”。")
+            return
+        remove_all = raw.casefold() in {"all", "全部"}
+        removed = await self.change_monitor.unsubscribe(
+            event.unified_msg_origin, "" if remove_all else raw
+        )
+        if removed:
+            yield event.plain_result(f"✅ 已取消 {removed} 项分类监控。")
+        else:
+            yield event.plain_result("当前会话没有匹配的分类监控。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("wiki监控列表", alias={"wikiwatchlist"})
+    async def list_watched_categories(self, event: AstrMessageEvent):
+        """列出当前会话的 Wiki 分类监控。"""
+        subscriptions = await self.change_monitor.subscriptions_for(
+            event.unified_msg_origin
+        )
+        if not subscriptions:
+            yield event.plain_result("当前会话尚未监控任何 Wiki 分类。")
+            return
+        lines = ["当前会话的 Wiki 分类监控："]
+        for index, subscription in enumerate(subscriptions, start=1):
+            suffix = "，已截断" if subscription.truncated else ""
+            lines.append(
+                f"{index}. {display_category(subscription.category)}"
+                f"（{len(subscription.member_page_ids)} 个页面{suffix}）"
+            )
+        lines.append(
+            f"轮询状态：{'已启用' if self.change_push_enabled else '已关闭'}；"
+            f"间隔 {self.change_monitor.poll_interval_seconds} 秒。"
+        )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("wiki检查更新", alias={"wikicheck"})
+    async def check_wiki_changes(self, event: AstrMessageEvent):
+        """立即执行一次分类变更检查。"""
+        try:
+            result = await self.change_monitor.poll_once()
+            yield event.plain_result(
+                "Wiki 变更检查完成："
+                f"抓取 {result.fetched}，匹配 {result.matched}，"
+                f"入队 {result.queued}，发送 {result.sent}，失败 {result.failed}。"
+            )
+        except MediaWikiError as exc:
+            logger.warning("Manual MediaWiki change poll failed: %s", exc)
+            yield event.plain_result(
+                f"⚠️ Wiki 变更检查失败：{self._friendly_error(exc)}"
+            )
+        except Exception as exc:
+            logger.exception("Unexpected manual MediaWiki change poll error")
+            yield event.plain_result(f"⚠️ Wiki 变更检查失败：{exc}")
+
     async def terminate(self):
+        await self.change_monitor.stop()
         await self.client.close()
+
+    async def _send_change_message(self, umo: str, text: str) -> None:
+        await self.context.send_message(umo, MessageChain().message(text))
+
+    def _change_link_prefix(self, umo: str) -> str:
+        platform = umo.casefold()
+        if "aiocqhttp" in platform or "onebot" in platform:
+            return self.qq_link_prefix
+        return ""
 
     @staticmethod
     def _parse_query_options(raw: str) -> tuple[bool, bool, str]:
